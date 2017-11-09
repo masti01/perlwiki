@@ -1,0 +1,82 @@
+package AddressChecker;
+
+use strict;
+use warnings;
+use Socket;
+use Log::Any;
+
+my $logger = Log::Any->get_logger;
+
+my @hostnames = (
+	{
+		'pattern' => qr/(?:ppp|adsl)\.tpnet\.pl$/,
+		'type'    => 'dynamic',
+		'block'   => '12 hours',
+	},
+	{
+		'pattern' => qr/^(?:dial|dynamic)-.+\.dialog\.net\.pl$/,
+		'type'    => 'dynamic',
+	},
+	{
+		'pattern' => qr/\.dynamic\.t-mobile\.pl$/,
+		'type'    => 'dynamic',
+	},
+	{
+		'pattern' => qr/^user-\d+-\d+-\d+-\d+\.play-internet\.pl$/,
+		'type'    => 'dynamic',
+	},
+	{
+		'pattern' => qr/\.adsl\.inetia\.pl$/,
+		'type'    => 'dynamic',
+		'block'   => '12 hours',
+	},
+	{
+		'pattern' => qr/\.gprs.*\.plus(?:gsm)?\.pl$/,
+		'type'    => 'dynamic',
+	},
+	{
+		'pattern' => qr/-gprs.+\.centertel\.pl$/,
+		'type'    => 'dynamic',
+	},
+	{
+		'pattern' => qr/dynamic\.chello\.pl$/,
+		'type'    => 'dynamic',
+		'block'   => '4 months',
+	},
+	{
+		'pattern' => qr/dynamic/,
+		'type'    => 'dynamic',
+		'block'   => '2 months',
+	},
+);
+
+sub check {
+	my $address = shift;
+	$logger->debug("Checking $address");
+	my $result = {};
+	my $info;
+	my $hostname = gethostbyaddr( inet_aton($address), AF_INET );
+
+	if ( defined $hostname ) {
+		$result->{hostname} = $hostname;
+		$logger->debug("The address $address resolves to $hostname");
+		foreach my $entry (@hostnames) {
+			if ( $hostname =~ $entry->{pattern} ) {
+				$info = $entry;
+				last;
+			}
+		}
+	}
+
+	if ( defined $info ) {
+		$result->{type}  = $info->{type};
+		$result->{block} = $info->{block};
+	}
+	else {
+		$result->{type}  = 'static';
+		$result->{block} = '6 months';
+	}
+	return $result;
+}
+
+1;

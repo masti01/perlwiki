@@ -1,0 +1,88 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Data::Dumper;
+use DateTime;
+use DateTime::Format::Strptime;
+use FindBin qw($RealBin);
+use lib "$RealBin/..";
+use Bot4;
+use ProxyDatabase;
+
+my $db   = "$RealBin/../var/proxy.sqlite";
+my $user = 'ProcseeBot';
+my $bot  = new Bot4;
+
+$bot->single(1);
+$bot->addOption( "database=s", \$db, "Changes path to a database" );
+$bot->setProject( 'wikipedia', 'en' );
+$bot->setup( 'root' => "$RealBin/.." );
+
+my $dateFormat = new DateTime::Format::Strptime(
+	pattern   => '%Y-%m-%dT%TZ',
+	time_zone => 'UTC',
+	on_error  => 'croak',
+);
+
+my $logger = Log::Any::get_logger;
+$logger->info("Start");
+
+my $dbh = ProxyDatabase->new( 'file' => $db );
+
+my $lastTimestamp = $dbh->getSetting('procseebot.last.timestamp');
+
+my $api  = $bot->getApi;
+my %args = (               #
+	'action'   => 'query',
+	'list'     => 'logevents',
+	'leaction' => 'block/block',
+	'leuser'   => 'ProcseeBot',
+	'ledir'    => 'newer',
+	'lelimit'  => 'max',
+);
+$args{lestart} = $lastTimestamp
+  if defined $lastTimestamp;
+
+my $iterator = $api->getIterator(%args);
+my $count    = 0;
+
+$dbh->begin;
+while ( my $entry = $iterator->next ) {
+	die "Invalid user '$entry->{user}'\n"
+	  unless $entry->{user} eq $user;
+
+	die "Invalid title '$entry->{title}'\n"
+	  unless $entry->{title} =~ m/^User:(\d+\.\d+\.\d+\.\d+)$/;
+
+	my $exitAddress = $1;
+
+	die "Invalid comment '$entry->{comment}'\n"
+	  unless $entry->{comment} =~ m/^\{\{blocked proxy\}\} <!-- (?:(\S+):)?(\d+) -->$/;
+
+	my $entryAddress = defined $1 ? $1 : $exitAddress;
+	my $port = $2;
+
+	$lastTimestamp = $entry->{timestamp};
+
+	my $now    = DateTime->now;
+	my $expiry = $dateFormat->parse_datetime( $entry->{params}->{expiry} );
+
+	if ( $expiry < $now ) {
+		$logger->info("Ignoring expired block $exitAddress ($entryAddress:$port)");
+	}
+	else {
+		$logger->info("Enqueueing $entryAddress:$port for scan");
+		$dbh->insertOrIgnoreProxy( "$entryAddress:$port", $user );
+	}
+
+	$lastTimestamp = $entry->{timestamp};
+
+	$count++;
+	if ( $count % 500 == 0 ) {
+		$dbh->setSetting( 'procseebot.last.timestamp', $lastTimestamp );
+		$dbh->commit;
+		$dbh->begin;
+	}
+}
+$dbh->setSetting( 'procseebot.last.timestamp', $lastTimestamp );
+$dbh->commit;

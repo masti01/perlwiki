@@ -1,0 +1,286 @@
+#!/usr/bin/perl -w
+
+use strict;
+use utf8;
+use Bot4;
+use Data::Dumper;
+use Text::Diff;
+use MediaWiki::Parser;
+
+my $logger = Log::Any::get_logger;
+$logger->info("Start");
+
+my $bot = new Bot4;
+$bot->setup;
+
+my $api = $bot->getApi( "wikipedia", "pl" );
+$api->checkAccount;
+
+my $sourceApi = $bot->getApi( "wikisource", "pl" );
+$sourceApi->checkAccount;
+
+# FIXME: dokładniej sprawdzać linki do plików
+
+# Wikisource-lang
+# Wikisource autor
+# Wikisource-cat
+my @templates = ( 'Szablon:Wikisource', 'Szablon:Multisource', 'Szablon:Wikisource-krotki' );
+
+my %titlesToCheck;
+my %titlesChecked;
+my %titlesRenamed;
+my %titlesNormalized;
+
+sub getList {
+	my %titles;
+	foreach my $template (@templates) {
+		$logger->info("Pobieranie listy stron z $template");
+
+		my $iterator = $api->getIterator(
+			'list'    => 'embeddedin',
+			'eititle' => $template,
+			'eilimit' => 'max',
+		);
+		while ( my $entry = $iterator->next ) {
+			next if $entry->{ns} != NS_MAIN;
+			$titles{ $entry->{title} }++;
+		}
+	}
+	return keys %titles;
+}
+
+my %templates = (
+	'Wikisource'        => \&extractLinksWikisource,
+	'Wikisource-krotki' => \&extractLinksWikisource,
+	'Multisource'       => \&extractLinksMultisource,
+);
+
+sub normalize($) {
+	my $link = shift;
+	if ( $link =~ /%/ ) {
+		utf8::encode($link);
+		$link =~ s/%([0-9A-F]{2})/ bytes::chr(hex($1)) /ige;
+		utf8::decode($link);
+	}
+	$link =~ tr/_/ /;
+	$link = ucfirst($link);
+	return $titlesNormalized{$link} if exists $titlesNormalized{$link};
+	return $link;
+}
+
+sub extractLinks($$) {
+	my ( $page, $template ) = @_;
+	die "Undefined page!" unless defined $page;
+
+	my $name    = ucfirst( $template->{name} );
+	my $handler = $templates{$name};
+	return () unless defined $handler;
+	return map { normalize($_) } &$handler( $page, $template );
+}
+
+sub extractLinksWikisource {
+	my ( $page, $template ) = @_;
+	$logger->trace("extractLinksWikisource( '$page->{title}', '$template->{name}' )");
+
+	my $title = $template->{fields}->{1};
+
+	# FIXME: sprawdzić problem z 1= !
+	# FIXME:
+	$title = $page->{title} if !defined $title or $title eq '';
+
+	return $title;
+}
+
+sub extractLinksMultisource {
+	my ( $page, $template ) = @_;
+	$logger->trace("extractLinksMultisource( '$page->{title}', '$template->{name}' )");
+
+	my @links;
+	foreach my $field ( keys %{ $template->{fields} } ) {
+		next unless $field =~ /^\d+$/;
+		next unless $field % 2;
+		push @links, $template->{fields}->{$field};
+	}
+
+	return @links;
+}
+
+sub findPage($) {
+	my $title = shift;
+	$logger->trace("findPage('$title')");
+
+	my %visited;
+	while ( exists $titlesRenamed{$title} ) {
+		last if $visited{$title};
+		$visited{$title}++;
+		$title = $titlesRenamed{$title};
+	}
+	if ( $titlesChecked{$title} ) {
+		return $title;
+	}
+	return undef;
+}
+
+my @titles        = getList;
+my $reportRenamed = '';
+my %links;
+
+$logger->info( "Stron do sprawdzenia: " . scalar(@titles) );
+
+while (@titles) {
+	$logger->info("Pobieranie stron");
+	my $response = $api->query(
+		'titles'  => join( "|", splice @titles, 0, 500 ),
+		'prop'    => 'revisions|info',
+		'intoken' => 'edit',
+		'rvprop'  => 'content|timestamp',
+	);
+
+	my @pages = values %{ $response->{query}->{pages} };
+	foreach my $page (@pages) {
+		my ($revision) = values %{ $page->{revisions} };
+		my @templates = extract_templates( $revision->{'*'} );
+
+		foreach my $template (@templates) {
+			foreach my $link ( extractLinks( $page, $template ) ) {
+				next if exists $titlesChecked{$link};
+				$titlesToCheck{$link}++;
+			}
+		}
+	}
+
+	my @titlesToCheck = keys %titlesToCheck;
+	%titlesToCheck = ();
+
+	$logger->info("Sprawdzanie linków na Wikisource");
+	while (@titlesToCheck) {
+		my $response = $sourceApi->query(
+			'titles' => join( "|", splice @titlesToCheck, 0, 500 ),
+			'prop'   => 'info',
+		);
+
+		my @missingTitles;
+
+		foreach my $page ( values %{ $response->{query}->{pages} } ) {
+			if ( exists $page->{missing} ) {
+				push @missingTitles, $page->{title};
+				$titlesChecked{ $page->{title} } = 0;
+			}
+			else {
+				$titlesChecked{ $page->{title} } = 1;
+			}
+		}
+
+		if ( $response->{query}->{normalized} ) {
+			foreach my $item ( values %{ $response->{query}->{normalized} } ) {
+				$titlesNormalized{ $item->{from} } = $item->{to};
+			}
+		}
+
+		while (@missingTitles) {
+			my $title = shift @missingTitles;
+			$logger->trace("Sprawdzanie logów dla $title");
+			my $response = $sourceApi->query(
+				'list'    => 'logevents',
+				'letype'  => 'move',
+				'letitle' => $title,
+			);
+			foreach my $entry ( values %{ $response->{query}->{logevents} } ) {
+				next unless $entry->{move};
+				$titlesRenamed{ $entry->{title} } = $entry->{move}->{new_title};
+				if ( !exists $titlesChecked{ $entry->{move}->{new_title} } ) {
+
+					# FIXME: nie jest sprawdzana obecność elementu na liście
+					push @titlesToCheck, $entry->{move}->{new_title};
+				}
+			}
+		}
+	}
+
+	foreach our $page (@pages) {
+		my ($revision) = values %{ $page->{revisions} };
+		my $content = $revision->{'*'};
+
+		our @linksRenamed = ();
+
+		sub delink($) {
+			my $code      = shift;
+			my @templates = extract_templates($code);
+
+			if ( @templates != 1 ) {
+				$logger->debug("Unable to parse template:\n$code");
+				return $code;
+			}
+
+			my $template = shift @templates;
+			my @links = extractLinks( $page, $template );
+
+			foreach my $link (@links) {
+				next unless defined $titlesChecked{$link};    # To nie powinno mieć miejsca
+
+				$links{$link}{"w:$page->{title}"}++;
+
+				if ( !$titlesChecked{$link} ) {
+					my $newTitle = findPage($link);
+					if ( defined $newTitle ) {
+						$logger->trace("New title for $link = $newTitle");
+						push @linksRenamed, "$link]] -> [[$newTitle";
+					}
+					else {
+						$logger->trace("New title for $link = (undef)");
+						$code = '' if @links == 1;
+					}
+				}
+			}
+			return $code;
+		}
+
+		$content =~ s/(\s*\{\{[^{}]+\}\})/ $_ = delink($1) /ge;
+		if ( $content ne $revision->{'*'} ) {
+			$logger->info( "Modyfikacja [[$page->{title}]]: " . diff( \$revision->{'*'}, \$content ) );
+
+			$_ = <STDIN>;
+			if ( $_ =~ /[TtYy]/i ) {
+				$api->edit(
+					title          => $page->{title},
+					token          => $page->{edittoken},
+					starttimestamp => $page->{starttimestamp},
+					basetimestamp  => $revision->{timestamp},
+					text           => $content,
+					bot            => 1,
+					summary        => "usunięcie martwych linków do wikiźródeł",
+					minor          => 1,
+				);
+			}
+		}
+		else {
+			$logger->debug("Brak zmian w [[$page->{title}]]");
+		}
+
+		if (@linksRenamed) {
+			local $" = "]], [[:";
+			$reportRenamed .= "* [[w:$page->{title}]]: [[:@linksRenamed]]\n";
+		}
+	}
+}
+
+my $report;
+$report .= "== Linkujące ==\n";
+
+foreach my $link ( sort keys %links ) {
+	$report .= "* [[:$link]]\n";
+	foreach my $l ( sort keys %{ $links{$link} } ) {
+		$report .= "** [[$l]]\n";
+	}
+}
+
+$report .= "\n== Linki do poprawy ==\n$reportRenamed";
+
+$logger->info("Zapis listy");
+$sourceApi->edit(
+	title   => "User:Beau.bot/listy/linkujące",
+	text    => $report,
+	summary => 'aktualizacja listy',
+);
+
+# perltidy -et=8 -l=0 -i=8

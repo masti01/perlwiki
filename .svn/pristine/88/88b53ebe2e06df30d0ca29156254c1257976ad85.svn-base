@@ -1,0 +1,777 @@
+#!/usr/bin/perl -w
+
+################################################################################
+#
+# This code is based on CorenSearchBot by [[en:User:Coren]] released under
+# [http://www.perlfoundation.org/artistic_license_2_0 Perl Artistic License 2.0]
+#
+# CorenSearchBot was modified by [[pl:User:Beau]] and is released under the same
+# terms.
+#
+# Original source code can be found at http://www.uberbox.org/~marc/csb.pl
+#
+################################################################################
+
+use strict;
+use utf8;
+use Bot4;
+use Data::Dumper;
+use LWP::UserAgent;
+use URI::Escape qw(uri_escape_utf8 uri_unescape);
+use Text::Align::WagnerFischer;
+use HTML::Entities qw(decode_entities);
+
+my $timestamp;
+my $rcid;
+
+my $bot = new Bot4;
+$bot->single(1);
+$bot->addOption( "timestamp=s" => \$timestamp );
+$bot->addOption( "rcid=i"      => \$rcid );
+
+$bot->setProject( "wikipedia", "pl" );
+$bot->setup;
+
+my $logger = Log::Any->get_logger();
+$logger->info("Start");
+
+my $api = $bot->getApi;
+$api->checkAccount;
+
+# The clock on tools.wikimedia.pl is sometimes out of sync.
+# Fetch the correct time from WMF servers.
+my $currentTime = $api->expandtemplates( 'text' => '{{#time:U}}' );
+die "Unable to fetch time from WMF servers.\n"
+  unless defined $currentTime;
+
+my $debug = 0;
+my ( %config, @exclude, @permissions, @allies );
+
+my $WIKI = 'pl.wikipedia.org';
+
+my $xua = LWP::UserAgent->new();
+$xua->agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/535.11 (KHTML, like Gecko) Chrome/17.0.963.56 Safari/535.11");
+$xua->timeout(20);
+$xua->max_size( 512 * 1024 );    # set the limit for the size of the response
+
+sub significant($) {
+	return unless defined $_[0];
+	my @in = split "\n", $_[0];
+	my @out;
+	foreach my $l (@in) {
+		next if $l =~ m/ Categor(y|ies) /;
+		next if $l =~ m/align/;
+		my $words = 0;
+		if ( $l =~ m/\b[a-z]{5,}\b/ ) {
+			$words++ while $l =~ m//g;
+		}
+		if ( $l =~ m/\b\*\b/ ) {
+			$words -= 2 while $l =~ m//g;
+		}
+		next if $words < 3;
+
+		#$l .= " [$words]";
+		push @out, $l;
+	}
+	return @out;
+}
+
+sub complete($) {
+	return unless defined $_[0];
+	my @in = split "\n", $_[0];
+	my @out;
+	foreach my $l (@in) {
+		next if $l =~ m/ Categor(y|ies) /;
+		push @out, $l;
+	}
+	return @out;
+}
+
+sub tokenize(@) {
+	my @t;
+	foreach my $l (@_) {
+		foreach my $t ( split /\s+/, $l ) {
+
+			#$t =~ s/(.{3,})ed/$1/;
+			#$t =~ s/(.{2,})ing/$1/;
+			#$t =~ s/(.{2,})s/$1/;
+			push @t, $t if length($t) > 2;
+		}
+	}
+	return @t;
+}
+
+sub statementize($) {
+	( $_, undef ) = @_;
+	return unless defined $_;
+	s/---*/ /g;
+	tr/!-?/ /;
+
+	#s/  */ /g;
+	s/^ *//g;
+	s/ *$//g;
+	s/\*([^ .])/$1/g;
+	s/\.  */.\n/g;
+
+	#while(s/([^. \n]) *([A-Z][a-zA-Z0-9_]*)/\1 */gs) { }
+	#while(s/\*  *\*/* /gs) { }
+	s/\.([A-Z])/\n$1/sg;
+	s/  *\././g;
+	s/\n+/\n/gs;
+	s/\.\n/\n/gs;
+	return $_;
+}
+
+sub normalizewikitext($) {
+	( $_, undef ) = @_;
+	return unless defined $_;
+
+	# Remove comments
+	s{<!--.*?-->}{ }igs;
+
+	# Remove categories
+	s/\[\[\s*(?:Category|Kategoria)\s*:\s*.+?\s*(?:\|.+?)?\]\]/ /ig;
+
+	# FIXME: remove all interwikis
+
+	tr/*#/::/;
+	s/&lt;ref&gt;.*?&lt;\/ref&gt;/ /igs;
+	s/&lt;.*?&gt;/ /igs;
+	s/&[^;]*;/ /gs;
+	while (s/('''*)(.*?)\1/ $2 /gs) { }
+	s/\[\[([^|\]]*)]]/ $1 /gs;
+	s/\[\[.*?\|(.*?)]]/ $1 /gs;
+	s/\[[^ ]* (.*?)]/ $1 /gs;
+	s/\[.*?]/ /gs;
+	s/^(===*)(.*?)\1/$2. /g;
+	s/{{.*?}}/ /gs;
+	s/^[:*]*\*.*/ /s;
+
+	return statementize $_;
+}
+
+sub normalizewebtext($) {
+	( $_, undef ) = @_;
+	return unless defined $_;
+
+	s{<!--.*?-->}{ }igs;                 # Remove comments
+	s{<style.*?>.*?</style>}{ }igs;      # Remove style tags
+	s{<script.*?>.*?</script>}{ }igs;    # Remove script tags
+	s/<.*?>/ /igs;                       # Remove the rest of tags
+	s/\&.*?;/ /gs;                       # Remove entities
+
+	return statementize $_;
+}
+
+# Using Google may breach the EULA unless special permission is obtained
+
+sub GoogleFind($) {
+	local $" = ' ';
+	$logger->debug("Google: @_");
+	my $response = $xua->get( 'http://www.google.pl/search?q=' . uri_escape_utf8( join( ' ', @_ ) ) . '&ie=utf-8&oe=utf-8&aq=t' );
+
+	# Extract links
+	my @links = $response->decoded_content =~ m{<h3 class="r"><a href="([^"]+)"}g;
+	if (@links) {
+
+		# Leave only first three links
+		@links = splice @links, 0, 3
+		  if @links > 3;
+
+		# Decode entites
+		@links = map { decode_entities $_ } @links;
+
+		# Convert to absolute URIs
+		@links = map { URI->new_abs( $_, $response->base )->as_string; } @links;
+
+		if ( $logger->is_debug ) {
+			foreach my $link (@links) {
+				$logger->debug("Found pages: $link");
+			}
+		}
+	}
+	else {
+		$logger->debug("No results found");
+	}
+	return @links;
+}
+
+sub top3($\%\%) {
+	my ( $query, $web, $wiki ) = @_;
+	my @uri = GoogleFind($query);
+
+      SITE:
+	foreach my $uri (@uri) {
+		next if $uri =~ m/\.pdf/i;
+		next if $uri =~ m/\.doc/i;
+
+		my $site;
+		$site = $1 if $uri =~ m{^[^:]*://([^/]*)/};
+
+		if ( $site eq $WIKI and $uri =~ m{/wiki/} ) {
+			$uri =~ s{.*/wiki/(.*)}{$1};
+			$uri = uri_unescape($uri);
+			utf8::decode($uri);    # Fix the encoding
+			$uri =~ tr/_/ /;
+			next if $uri =~ m/^User(?: Talk)?:/i;
+			$wiki->{$uri}++;
+			next;
+		}
+		foreach my $re (@exclude) {
+			if ( $uri =~ $re ) {
+				$logger->info("Ignoring $uri, exclusion: $re");
+				next SITE;
+			}
+		}
+		foreach my $permitted (@permissions) {
+			if ( index( $uri, $permitted ) > -1 ) {
+				$logger->info("Ignoring $uri, permission: $permitted");
+				next SITE;
+			}
+		}
+
+		$web->{$uri}++;
+
+		last if scalar keys %{$web} > 6;
+	}
+}
+
+sub checkPage($$) {
+	my ( $title, $article ) = @_;
+
+	$bot->status("Checking [[$title]]");
+
+	my @atokens = tokenize complete normalizewikitext $article;
+	my @paras   = significant normalizewikitext $article;
+
+	if ($debug) {
+		local $" = ' ';
+		$logger->debug("atokens: @atokens");
+	}
+
+	my $why   = undef;
+	my $score = $config{MinScore};
+	my $what  = undef;
+	my $what_ok;
+	my $score_ok = 50000;
+
+	my %web;     # Hash to avoid duplicates
+	my %wiki;    # Hash to avoid duplicates
+
+	return if $#atokens < 5;
+	$#atokens = 150 if $#atokens > 150;
+
+	my @uri;
+	my $ln = 0;
+
+	$title =~ s/\(.*?\) *//;
+	$bot->status("Searching");
+
+	foreach my $l (@paras) {
+		if ( $ln == 1 or $ln == 7 or $ln == ( $#paras - 1 ) ) {
+			if ( $l =~ m/ (.*)\.?/ ) {
+				my @tq = split ' ', $1;
+				my @q;
+				my $num = 0;
+				foreach my $w (@tq) {
+					push @q, $w if $w =~ m/[a-zA-Z0-9*]/;
+					$num++ if not $w eq '*';
+					last if $num > 9;
+				}
+				my $q = join ' ', @q;
+				top3 "\"$title\" $q", %web, %wiki;
+			}
+		}
+		$ln++;
+	}
+	return unless scalar @paras;
+	top3 "\"$title\"", %web, %wiki;
+
+	# Check remote sites
+	foreach my $uri ( keys %web ) {
+		$logger->info("Comparing with $uri");
+		$bot->status("Comparing with $uri");
+
+		my $res = $xua->get($uri);
+		unless ( $res->is_success ) {
+			$logger->warn( "Unable to check $uri: " . $res->status_line );
+			next;
+		}
+		my $content = $res->decoded_content;
+
+		my @src = tokenize complete normalizewebtext $content;
+
+		if ($debug) {
+			local $" = ' ';
+			$logger->debug("content: \n$content");
+			$logger->debug("src: @src");
+		}
+
+		if ( $#src < 20 ) {
+			$logger->info("Ignoring $uri, the page is too short");
+			next;
+		}
+
+		if ( $content =~ /(?:Wikipedia|Wikimedia|Wikipedysta|wgGlobalGroups)/i ) {
+			$logger->info("Ignoring $uri, page appears to be a copy from Wikipedia");
+			next;
+		}
+
+		$#src = 30000 / $#atokens if $#src * $#atokens > 30000;
+
+		my $alignment = Text::Align::WagnerFischer->new(
+			left    => \@src,
+			right   => \@atokens,
+			weights => [ 0, 1, 2 ]
+		);
+
+		my $dif = abs( $#src - $#atokens );
+
+		my $sina = ( $alignment->cost() - $dif ) * 1000 / $#src;
+		my $ains = ( $alignment->cost() - $dif ) * 1000 / $#atokens;
+
+		my $maybe = 'pageincluded';
+		if ( $ains > $sina ) {
+			$maybe = 'pageincludes';
+			$sina  = $ains;
+		}
+		my $need = $config{MinScore};
+		$need = ( $need * $#atokens ) / 200 if $#atokens < 200;
+		$logger->info( "Compare result of $uri: " . int($sina) );    #if $sina < $need;
+		if ( $sina < $need and $sina < $score ) {
+			$why   = $maybe;
+			$score = $sina;
+			$what  = $uri;
+		}
+		if ( $sina < $score_ok ) {
+			$score_ok = $sina;
+			$what_ok  = $uri;
+		}
+	}
+
+	delete $wiki{ $_[0] };                                               # Ignore the page being checked
+	delete $wiki{'Wikipedia:Brudnopis'};                                 # Ignore the sandbox
+
+	# Check local wikipages
+	my @wiki = keys %wiki;
+	while (@wiki) {
+		my @list = splice( @wiki, 0, 10 );
+
+		local $" = "]], [[";
+		$logger->info("Fetching pages: [[@list]]");
+		$bot->status("Fetching pages: [[@list]]");
+
+		# FIXME: error handling !
+		my $data = $api->query(
+			'prop'   => 'revisions',
+			'titles' => join( "|", @list ),
+			'rvprop' => 'content',
+		);
+
+		foreach my $page ( values %{ $data->{query}->{pages} } ) {
+			$logger->info("Comparing with [[$page->{title}]]");
+
+			my ($revision) = values %{ $page->{revisions} };
+
+			my @src = tokenize complete normalizewikitext $revision->{'*'};
+
+			if ( $#src < 20 ) {
+				$logger->info("Ignoring [[$page->{title}]], the page is too short");
+				next;
+			}
+
+			$#src = 30000 / $#atokens if $#src * $#atokens > 30000;
+			my $alignment = Text::Align::WagnerFischer->new(
+				left    => \@src,
+				right   => \@atokens,
+				weights => [ -1, 1, 2 ]
+			);
+			my $sina = $alignment->cost() * 1000 / $#src;
+			my $ains = $alignment->cost() * 1000 / $#atokens;
+
+			$sina = $ains if $ains < $sina;
+			$logger->info( "[[$page->{title}]]: Compare result: " . int( 100 * $sina / -400 ) );    # if $sina < -400;
+			if ( $sina < -400 and $sina < $score ) {
+				$logger->info("CV wikipage [[$page->{title}]] $sina ?");
+			}
+
+=head
+				$why   = 'wikipage';
+				$what  = $page->{title};
+				$score = $sina;
+			}
+			if ( $sina < $score_ok ) {
+				$score_ok = $sina;
+				$what_ok  = $page->{title};
+			}
+=cut
+
+		}
+	}
+
+	if ( $score < $config{MinScore} ) {
+		return ( $why, $what, ($score) / 10 );
+	}
+}
+
+sub getTemplate($$;$$) {
+	my ( $type, $url, $notification, $page ) = @_;
+
+	my %types = (
+		'pageincluded' => 'całość',
+		'pageincludes' => 'fragmenty',
+		'wikipage'     => 'wikistrony',
+	);
+
+	die "Unknown type '$type'\n" unless exists $types{$type};
+
+	if ($notification) {
+		return "{{subst:NPA $types{$type}/powiadomienie|url=$url|strona=$page|bot=$api->{login}|opiekun=Beau}}\n";
+	}
+	else {
+		return "{{NPA $types{$type}|url=$url|bot=$api->{login}|opiekun=Beau}}";
+	}
+}
+
+sub tagPage($$$$) {
+	my ( $page, $user, $type, $url ) = @_;
+	$logger->info("Tagging [[$page->{title}]]");
+	$bot->status("Tagging [[$page->{title}]]");
+
+	my ($revision) = values %{ $page->{revisions} };
+
+	my $tag = getTemplate( $type, $url, 0 ) . "\n";
+
+	foreach my $ally (@allies) {
+		return "creator trusted" if $user eq $ally;
+	}
+
+	# FIXME: error handling !!!
+
+	eval {
+		my $summary = "Artykuł może naruszać prawa autorskie - " . ( $type eq 'wikipage' ? "[[$url]]" : $url );
+
+		$api->edit(
+			'title'          => $page->{title},
+			'token'          => $page->{edittoken},
+			'starttimestamp' => $page->{starttimestamp},
+			'summary'        => $summary,
+			'minor'          => 1,
+			'nocreate'       => 1,
+			'prependtext'    => $tag,
+		);
+
+	};
+	if ($@) {
+		$logger->error("Unable to tag the page [[$page->{title}]]: $@");
+		return 'aborted';
+	}
+	else {
+		my $messageSent = informUser(@_);
+		reportPage( @_, $messageSent );
+	}
+}
+
+sub informUser($$$$) {
+	my ( $page, $user, $type, $what ) = @_;
+	return 0 unless defined $user;
+
+	my $title = "[[:$page->{title}]]";
+	my $content = getTemplate( $type, $what, 1, $page->{title} ) . "~~~~";
+
+	my $attempt = 5;
+	while ($attempt) {
+		eval {
+
+			# Send message
+			$api->sendMessage( $user, $title, $content );
+		};
+		if ($@) {
+			$logger->error("Unable to send the message to $user: $@");
+			$attempt--;
+			sleep(5);
+		}
+		else {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+sub reportPage($$$$;$) {
+	my ( $page, $user, $type, $url, $messageSent ) = @_;
+
+	return unless defined $config{ReportTo};
+
+	$logger->info("Reporting [[$page->{title}]]");
+	$bot->status("Reporting [[$page->{title}]]");
+
+	my $report = "\n=== [[$page->{title}]] ===\n";
+
+	if ( $type eq 'wikipage' ) {
+		$report .= "* źródło: [[$url]]\n";
+	}
+	else {
+		$report .= "* źródło: [$url $url]\n";
+		$report .= "* zapytanie: niewysłane\n";
+	}
+	if ($messageSent) {
+		$report .= "* test NPA dla wstawiającego: wstawiony użytkownikowi [[User talk:$user|$user]]\n";
+	}
+	else {
+		$report .= "* test NPA dla wstawiającego: nie został wstawiony\n";
+	}
+	$report .= "* uwagi: automatycznie zgłoszone przez ~~~~\n";
+
+	my $attempt = 5;
+	while ($attempt) {
+		eval {
+			my $data = $api->query(
+				'prop'    => 'revisions|info',
+				'intoken' => 'edit',
+				'titles'  => $config{ReportTo},
+				'rvlimit' => 1,
+				'rvdir'   => 'older',
+				'rvprop'  => 'content|timestamp',
+				'maxlag'  => 20,
+			);
+
+			my ($reportPage) = values %{ $data->{query}->{pages} };
+
+			die "The report page [[$config{ReportTo}]] is missing"
+			  if exists $reportPage->{missing};
+
+			my ($revision) = values %{ $reportPage->{revisions} };
+			my $content = $revision->{"*"};
+			foreach my $link ( $content =~ m/===\s+\[\[(.+?)\]\]\s+===/g ) {
+				if ( $link eq $page->{title} ) {
+					$logger->info("[[$page->{title}]] The page is already reported");
+					return;
+				}
+			}
+
+			die "Unable to find the placeholder\n"
+			  unless $content =~ s/(?<=<!-- Beau.bot wstawia tutaj -->)/\n$report/;
+
+			$api->edit(
+				title          => $config{ReportTo},
+				token          => $reportPage->{edittoken},
+				starttimestamp => $reportPage->{starttimestamp},
+				basetimestamp  => $revision->{timestamp},
+				text           => $content,
+				bot            => 1,
+				summary        => "Automatyczne dodanie na listę strony [[$page->{title}]]",
+				notminor       => 1,
+			);
+		};
+		if ($@) {
+			$logger->error("Unable to report the page [[$page->{title}]]: $@");
+			$attempt--;
+			sleep(5);
+		}
+		else {
+			last;
+		}
+	}
+}
+
+sub readConfig() {
+	%config      = ();
+	@exclude     = ();
+	@permissions = ();
+	@allies      = ();
+
+	push @exclude, qr{slimok\.pl/}i;
+	push @exclude, qr{ekspozycje\.net/sztuka}i;
+	push @exclude, qr{\.sypialnia\.org/}i;
+	push @exclude, qr{redlink=1}i;
+	push @exclude, qr{www\.ossus\.pl/biblioteka/}i;
+	push @exclude, qr{www\.vetrotexglassmat\.com\.pl}i;
+	push @exclude, qr{www\.motoryzacja\.startauto\.pl}i;
+	push @exclude, qr{www\.wiedza\.filmywedkarskie\.pl}i;
+	push @exclude, qr{wapedia\.mobi/pl}i;
+	push @exclude, qr{spam-factory\.eu}i;
+	push @exclude, qr{www\.sklep\.motylki\.info}i;
+	push @exclude, qr{www\.dbsoftware\.pl}i;
+	push @exclude, qr{www\.krrp\.pl/wiki}i;
+	push @exclude, qr{www\.szybkie-czytanie\.iswift\.eu}i;
+	push @exclude, qr{newsy\.blox\.pl}i;
+	push @exclude, qr{wiki\.e-top\.com\.pl}i;
+	push @exclude, qr{helionica\.pl}i;
+	push @exclude, qr{www\.encyklopedia\.biolog\.pl}i;
+	push @exclude, qr{www\.energoso\.com\.pl/wiki}i;
+	push @exclude, qr{www\.blogpl\.pl}i;
+	push @exclude, qr{www\.mo\.finansenaauto\.info}i;
+	push @exclude, qr{alekosa\.katowice\.pl}i;
+	push @exclude, qr{roweroweinspiracje\.pl}i;
+	push @exclude, qr{mylondon24\.eu}i;
+	push @exclude, qr{szwecja24\.rawa-maz\.pl}i;
+	push @exclude, qr{\.budova24\.eu}i;
+	push @exclude, qr{indietours\.rybnik\.pl}i;
+	push @exclude, qr{www\.e-paryz\.eu}i;
+	push @exclude, qr{hanower24\.ostroleka\.pl}i;
+	push @exclude, qr{wafiso\.augustow\.pl}i;
+	push @exclude, qr{malawi24\.eu}i;
+	push @exclude, qr{amsterdam24x7\.malopolska\.pl}i;
+	push @exclude, qr{gabon24x7\.eu}i;
+
+	push @exclude, qr{(?<!pl)\.wikipedia\.org}i;
+
+	$config{MinScore} = 600;
+	$config{ReportTo} = 'Project:Lista NPA';
+
+	my $iterator = $api->getIterator(
+		'prop'    => 'extlinks',
+		'titles'  => 'Project:Zapytania o zgodę na wykorzystanie/uzyskane zgody',
+		'ellimit' => 'max',
+	);
+
+	while ( my $page = $iterator->next ) {
+		foreach my $link ( values %{ $page->{extlinks} } ) {
+			$link = $link->{'*'};
+			next if $link =~ /^mailto:/i;
+			next if $link =~ /wiki(?:media|pedia)\.org/i;
+			push @permissions, $link;
+		}
+	}
+	local $" = "\n- ";
+	$logger->info("Permissions:\n- @permissions");
+
+	# FIXME: do we really need that?
+	# FIXME: error handling
+
+=head
+	my $name = $api->{login};
+	my @list = ( "User:$name/config", "User:$name/exclude", "User:$name/allies" );
+
+	my $data = $api->query(
+		'prop'   => 'revisions',
+		'titles' => join( "|", @list ),
+		'rvprop' => 'content',
+	);
+	$logger->info("Exclusions:\n- @exclude");
+	$logger->info("Allies:\n- @allies");
+
+	$logger->info("Report to '$config{ReportTo}'");
+	$logger->info("Is a copy below $config{MinScore}");
+=cut
+
+}
+
+readConfig;
+
+my $storable = $bot->retrieveData();
+
+my $rcend = to_wiki_timestamp( $currentTime - 15 * 60 );
+$timestamp = $storable->{timestamp}
+  unless defined $timestamp;
+$rcid = $storable->{rcid}
+  unless defined $rcid;
+$rcid ||= 0;
+
+my $baseRcid = $rcid;
+
+$logger->info( "Current wiki time: " . to_wiki_timestamp($currentTime) );
+$logger->info("Checking new pages created between $timestamp and $rcend");
+
+my $iterator = $api->getIterator(
+	'list'        => 'recentchanges',
+	'rcprop'      => 'title|timestamp|ids|user',
+	'rctype'      => 'new',
+	'rcnamespace' => '0',                          # '0|4|12|14|100|102',
+	'rclimit'     => 'max',
+	'rcdir'       => 'newer',
+	'rcstart'     => $timestamp,
+	'rcend'       => $rcend,
+);
+
+while ( my $item = $iterator->next ) {
+	next if $item->{rcid} <= $baseRcid;
+	next if $item->{timestamp} gt $rcend;
+
+	$timestamp = $item->{timestamp}
+	  if $timestamp lt $item->{timestamp};
+
+	$rcid = $item->{rcid}
+	  if $rcid < $item->{rcid};
+
+	$logger->info("Checking [[$item->{title}]]");
+	$bot->status("Checking [[$item->{title}]]");
+
+	my $data = $api->query(
+		'prop'    => 'revisions|info|categories',
+		'intoken' => 'edit',
+		'titles'  => $item->{title},
+		'rvlimit' => 1,
+		'rvdir'   => 'older',
+		'rvprop'  => 'content|timestamp',
+		'maxlag'  => 20,
+	);
+
+	my ($page) = values %{ $data->{query}->{pages} };
+
+	if ( exists $page->{missing} ) {
+		$logger->info("[[$item->{title}]] The page is missing");
+		next;
+	}
+
+	my ($revision) = values %{ $page->{revisions} };
+	my $content = $revision->{"*"};
+
+	if ( exists $page->{redirect} ) {
+		$logger->info("[[$item->{title}]] The page is a redirect");
+		next;
+	}
+
+	if ( $content =~ /^#REDIRECT/i ) {
+		$logger->info("[[$item->{title}]] The page is a redirect?!?");
+		next;
+	}
+	my %categories;
+	if ( $page->{categories} ) {
+		%categories = map { $_->{title} => 1 } values %{ $page->{categories} };
+	}
+
+	if ( exists $categories{"Kategoria:Ekspresowe kasowanie"} ) {
+		$logger->info("[[$item->{title}]] The page is a candidate for the speedy deletion");
+		next;
+	}
+
+	if ( exists $categories{"Kategoria:Automatyczne wykrywanie NPA"} or exists $categories{"Kategoria:Artykuły podejrzane o naruszenie praw autorskich"} ) {
+		$logger->info("[[$item->{title}]] The page is already marked as a copyright violation");
+		next;
+	}
+
+	# Text::Align::WagnerFischer module leaks horribly
+
+	my $pid = fork();
+
+	die "Unable to fork: $!" unless defined $pid;
+
+	if ($pid) {
+		$bot->status("Waiting for the child process");
+		wait();
+	}
+	else {
+		my ( $why, $what, $score ) = checkPage( $page->{title}, $content );
+
+		if ( defined $why and $why ne '' ) {
+			$logger->info("[[$item->{title}]] Result: The page is a copyright violation, WHY: '$why', WHAT: '$what', SCORE: $score");
+
+			my $res = tagPage( $page, $item->{user}, $why, $what );
+			$logger->info("[[$item->{title}]] Tagging aborted: $res")
+			  if $res;
+		}
+		else {
+			$logger->info("[[$item->{title}]] Result: The page is not a copyright violation");
+		}
+		exit(0);
+	}
+}
+
+$storable->{timestamp} = $timestamp;
+$storable->{rcid}      = $rcid;
+
+$bot->storeData($storable);
+
+# perltidy -et=8 -l=0 -i=8

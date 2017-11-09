@@ -1,0 +1,48 @@
+MAILTO="beau@adres.pl"
+PERLLIB="/usr/home/beau/tools:/usr/home/beau/tools/lib:/usr/home/beau/local/lib64/perl5/5.12.3:/usr/home/beau/local/lib64/perl5/5.12.3/x86_64-linux:/usr/home/beau/local/lib64/perl5/site_perl/5.12.3:/usr/home/beau/local/lib64/perl5/site_perl/5.12.3/x86_64-linux"
+LC_ALL="pl_PL.UTF-8"
+DAEMON=1
+
+# Beau.bot - uruchomione stale
+*/10 * * * *	cd tools; perl rcbot.pl
+
+# Beau.bot - uruchamiane okresowo
+*/15 * * * *	perl tools/check-new-files.pl
+*/5  * * * *	perl tools/check-new-pages.pl; sleep 2m; perl tools/check-cv.pl
+*/15 * * * *	perl tools/greet-new-editors.pl
+0 */2 * * *	perl tools/spawn.double-redirects
+0 8,20 * * *	perl tools/sandbox-categories.pl
+0 18 * * 7	perl tools/list-bots.pl
+0 19 * * 7	perl tools/soft-redirect.pl
+5 * * * *	perl tools/check-cv-purge-reports.pl
+7 * * * *	perl tools/reset-sandbox.pl
+15 */12 * * *	perl tools/archive.pl
+#3 5 * * 1,3,5	perl tools/wikt-a-tergo.pl
+3 5 * * 2	perl tools/wikt-pronun.pl
+3 5 * * 6	perl tools/wikt-index.pl
+3 5 * * 4	perl tools/list-incoherent-dates.pl
+0 2 * * 1	perl tools/wikipedia-create-dnu-categories.pl
+0 19 * * 5	perl tools/wikisource-list.pl; perl tools/wikisource-list.pl --family=wikibooks
+#0 16 * * 5	perl tools/wikipedia-zabytki.pl --scan
+
+# Beau.bot.admin
+3 1 * * *	perl tools/delete-talk-redirects.pl
+3 2 * * *	perl tools/delete-old-usertalks.pl
+3 14 * * *	perl tools/delete-bez-infoboksu.pl
+*/30 * * * *	cd tools/proxy; perl proxy-block.pl
+47 */4 * * *	cd tools/proxy; perl proxy-import-1.pl
+*/30 * * * *	cd tools/proxy; perl proxy-import-2.pl
+48 */4 * * *	cd tools/proxy; perl proxy-import-3.pl
+49 */4 * * *	cd tools/proxy; perl proxy-import-4.pl
+50 */4 * * *	cd tools/proxy; perl proxy-import-5.pl
+12 * * * *	cd tools/proxy; perl proxy-check.pl
+
+# www
+*/5 * * * *	perl tools/list-votes.pl
+*/5 * * * *	perl tools/stats-admin.pl
+0 7 * * *	perl tools/mediawiki-gadgets-list.pl
+
+# inne
+0 16 * * *	perl tools/check-cookies.pl
+*/10 * * * *	perl tools/spawn.irssi
+5 1 * * *	/usr/sbin/logrotate -s logrotate.status logrotate.conf

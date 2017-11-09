@@ -1,0 +1,146 @@
+#!/usr/bin/perl -w
+
+use strict;
+use utf8;
+use Bot4;
+use Log::Any;
+use Data::Dumper;
+use DateTime;
+use DateTime::Format::Strptime;
+use DBI;
+
+my $db = 'var/rc.sqlite';
+
+my $bot = new Bot4;
+$bot->setup;
+
+my $logger = Log::Any::get_logger;
+
+my $dbh = DBI->connect( "dbi:SQLite:dbname=$db", "", "", { RaiseError => 1, PrintError => 0, sqlite_use_immediate_transaction => 1 } );
+
+my $selectProjectSth = $dbh->prepare('SELECT project_id FROM projects WHERE project_name = ?');
+my $insertProjectSth = $dbh->prepare('INSERT INTO projects (project_name) VALUES (?)');
+my %projects;
+
+sub getProjectId($) {
+	my $name = shift;
+	if ( defined $projects{$name} ) {
+		return $projects{$name};
+	}
+	$selectProjectSth->execute($name);
+	if ( my ($id) = $selectProjectSth->fetchrow_array ) {
+		$projects{$name} = $id;
+		return $id;
+	}
+	else {
+		$insertProjectSth->execute($name);
+		my $id = $dbh->last_insert_id( "", "", "", "" );
+		$projects{$name} = $id;
+		return $id;
+	}
+}
+
+my $selectRcIdSth = $dbh->prepare("SELECT rc_id FROM recentchanges WHERE rc_project = ? AND rc_newrevid = ?");
+my $insertRcSth   = $dbh->prepare("INSERT INTO recentchanges(rc_project, rc_title, rc_newrevid, rc_user, rc_timestamp, rc_comment) VALUES(?, ?, ?, ?, ?, ?)");
+
+my $insertAbuseEditSth = $dbh->prepare("INSERT OR IGNORE INTO abusers_edits(ae_edit, ae_confirmed) VALUES(?, ?)");
+my $updateAbuseEditSth = $dbh->prepare("UPDATE abusers_edits SET ae_confirmed = 1 WHERE ae_confirmed = -1 AND ae_edit = ?");
+
+sub insertEdit {
+	my %args = @_;
+	$logger->info( "Recording an edit " . Dumper \%args );
+
+	$selectRcIdSth->execute( $args{project}, $args{revision} );
+	my ($rc_id) = $selectRcIdSth->fetchrow_array;
+	unless ( defined $rc_id ) {
+		$insertRcSth->execute( $args{project}, $args{title}, $args{revision}, $args{user}, $args{timestamp}, $args{comment} );
+		$rc_id = $dbh->last_insert_id( "", "", "", "" );
+	}
+	$updateAbuseEditSth->execute($rc_id);
+	unless ( $updateAbuseEditSth->rows ) {
+		$insertAbuseEditSth->execute( $rc_id, 1 );
+	}
+}
+
+my %list;
+
+while (<>) {
+	s/\s+$//;
+	my $link = $_;
+
+	$link =~ s{^https://secure\.wikimedia\.org/(.+?)/(.+?)/}{http://$2.$1.org/};
+
+	die "Unable to parse link: $link\n"
+	  unless $link =~ m{https?://([^.]+?)\.([^.]+?)\.org};
+
+	my $family = $2;
+	my $lang   = $1;
+
+	my $api = $bot->getApi( $family, $lang, "beau" );
+	my $projectId = getProjectId("$lang.$family");
+
+	if ( $link =~ /diff=(\d+)/ ) {
+		my $response = $api->query(
+			'action' => 'query',
+			'revids' => $1,
+			'prop'   => 'revisions',
+			'rvprop' => [ 'ids', 'comment', 'user', 'timestamp' ],
+		);
+
+		my ($page)     = values %{ $response->{query}->{pages} };
+		my ($revision) = values %{ $page->{revisions} };
+
+		insertEdit(
+			'project'   => $projectId,
+			'revision'  => $revision->{revid},
+			'user'      => $revision->{user},
+			'comment'   => $revision->{comment},
+			'title'     => $page->{title},
+			'timestamp' => $revision->{timestamp},
+		);
+	}
+	elsif ( $link =~ /[&?]diff=prev&oldid=(\d+)/ ) {
+		my $response = $api->query(
+			'action'   => 'query',
+			'revids'   => $1,
+			'prop'     => 'revisions',
+			'rvdiffto' => 'prev',
+			'rvprop'   => [ 'ids', 'comment', 'user', 'timestamp' ],
+		);
+
+		my ($page)     = values %{ $response->{query}->{pages} };
+		my ($revision) = values %{ $page->{revisions} };
+
+		insertEdit(
+			'project'   => $projectId,
+			'revision'  => $revision->{revid},
+			'user'      => $revision->{user},
+			'comment'   => $revision->{comment},
+			'title'     => $page->{title},
+			'timestamp' => $revision->{timestamp},
+		);
+	}
+	elsif ( $link =~ m{/(\d+.\d+.\d+.\d+|Wandaler)$} ) {
+		my $iterator = $api->getIterator(
+			'list'    => 'usercontribs',
+			'ucprop'  => 'title|comment|ids|timestamp',
+			'ucuser'  => $1,
+			'uclimit' => 'max',
+		);
+		while ( my $contrib = $iterator->next ) {
+			insertEdit(
+				'project'   => $projectId,
+				'revision'  => $contrib->{revid},
+				'user'      => $contrib->{user},
+				'comment'   => $contrib->{comment},
+				'title'     => $contrib->{title},
+				'timestamp' => $contrib->{timestamp},
+			);
+		}
+	}
+	else {
+		die "Unable to parse link: $link\n";
+	}
+}
+
+# perltidy -et=8 -l=0 -i=8

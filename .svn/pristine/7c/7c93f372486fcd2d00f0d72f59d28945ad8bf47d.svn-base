@@ -1,0 +1,144 @@
+#!/usr/bin/perl -w
+
+use strict;
+use utf8;
+use Bot4;
+use Data::Dumper;
+use Text::Diff;
+use MediaWiki::Parser;
+
+my $bot = new Bot4;
+$bot->setup;
+
+my $logger = Log::Any::get_logger;
+$logger->info("Start");
+
+my $api = $bot->getApi( "wikipedia", "pl" );
+$api->checkAccount;
+
+my @fields = ( "rodzaj płyty", "wykonawca", "tytuł", "okładka", "wydany", "nagrany", "gatunek", "długość", "wytwórnia_płytowa", "producent", "oceny", "poprzedni_album", "poprzedni_album_rok", "rok_wydania", "następny_album", "następny_album_rok", );
+
+#my $re = qr/^(\{\{Album infobox[^{]+?^\|?\}\}\n)/sm;
+my $re = qr/^(\{\{Album infobox(?:[^\{\}]*(?:\{\{.*?\}\})?)*\}\}\n)/sm;
+
+my $iterator = $api->getIterator(
+	'generator' => 'categorymembers',
+	'prop'      => 'revisions|info',
+	'rvprop'    => 'content|timestamp',
+	'intoken'   => 'edit',
+	'gcmtitle'  => 'Kategoria:Albumy muzyczne z rokiem wydania do weryfikacji',
+	'gcmlimit'  => 10,
+);
+
+OUTER: while ( my $page = $iterator->next ) {
+	$logger->info("Strona [[$page->{title}]]:");
+
+	my ($revision) = values %{ $page->{revisions} };
+	my $content = $revision->{'*'};
+	return unless defined $content;
+
+	$content =~ s/\[\[\s+/[[/g;
+	$content =~ s/\s+\]\]/]]/g;
+
+	unless ( $content =~ $re ) {
+		print "$revision->{'*'}\nFailed!\n";
+		next;
+	}
+	my $oldtemplate = $1;
+	my ($data) = extract_templates($oldtemplate);
+
+	#print Dumper $data;
+	my $changed = 0;
+
+	# usunięcie pól nieużywanych
+	foreach my $field ( keys %{ $data->{fields} } ) {
+		if ( $data->{fields}->{$field} =~ /^(?:-+|''-''|\[\[[-?]\]\]|\?+|\s*)$/ ) {
+			delete $data->{fields}->{$field};
+		}
+	}
+
+	# poprawa wartości pól
+      INNER: foreach my $field ( 'poprzedni_album_rok', 'rok_wydania', 'następny_album_rok' ) {
+		next unless defined $data->{fields}->{$field};
+
+		print "$field = $data->{fields}->{$field}\n";
+		my @values = $data->{fields}->{$field} =~ /(\d\d\d\d)/g;
+
+		# usuń powtórzenia
+		my %values = map { $_ => 1 } @values;
+		@values = keys %values;
+
+		if ( !scalar @values ) {
+			next;
+		}
+		elsif ( scalar @values == 1 ) {
+			$data->{fields}->{$field} = $values[0];
+			print "$field = $data->{fields}->{$field}\n";
+			$changed++;
+		}
+		else {
+			local $" = ", ";
+			print "Multiple values for $field: @values\n";
+			next OUTER;
+		}
+	}
+
+	# weryfikacja roku wydania
+	if ( defined $data->{fields}->{wydany} && $data->{fields}->{wydany} =~ /(\d\d\d\d)/ ) {
+		if ( $data->{fields}->{rok_wydania} eq '' ) {
+			$data->{fields}->{rok_wydania} = $1;
+			$changed++;
+		}
+		elsif ( $data->{fields}->{rok_wydania} ne $1 ) {
+			print "rok_wydania != wydany\n";
+			next;
+		}
+	}
+
+	next unless $changed;
+
+	# rekonstrukcja podstawowej wersji szablonu
+	foreach my $field (@fields) {
+		$data->{fields}->{$field} = '' unless exists $data->{fields}->{$field};
+	}
+
+	# regeneracja wywołania szablonu
+	my $template = "{{Album infobox\n";
+	foreach my $field ( @fields, @{ $data->{order} } ) {
+		my $value = $data->{fields}->{$field};
+		next unless defined $data->{fields}->{$field};
+		next if $field =~ m/^\d+$/;
+
+		my $prefix = $field;
+
+		$prefix .= ' ' x ( 20 - length $prefix ) if ( length($prefix) < 26 );
+		if ( $value =~ /^(?:-+|''-''|\[\[[-?]\]\]|\?+)$/ ) {
+			$value = '';
+		}
+		$template .= " | $prefix= $value\n";
+		delete $data->{fields}->{$field};
+	}
+
+	$template .= "}}\n";
+	$content =~ s/$re/$template/;
+
+	next if $content eq $revision->{'*'};
+	print diff( \$revision->{'*'}, \$content ) . "\n";
+
+	$_ = <STDIN>;
+	next if ( $_ !~ /[TtYy]/i );
+
+	$api->edit(
+		title          => $page->{title},
+		token          => $page->{edittoken},
+		starttimestamp => $page->{starttimestamp},
+		text           => $content,
+		bot            => 1,
+		minor          => 1,
+		summary        => "poprawa szablonu {{Album infobox}}",
+		basetimestamp  => $revision->{timestamp},
+		nocreate       => 1,
+	);
+}
+
+# perltidy -et=8 -l=0 -i=8

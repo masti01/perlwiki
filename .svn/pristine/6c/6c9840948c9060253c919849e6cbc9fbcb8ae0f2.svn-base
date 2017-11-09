@@ -1,0 +1,25 @@
+#!/usr/bin/perl -w
+
+use strict;
+use POSIX qw(setsid);
+use Env;
+
+chdir("$ENV{HOME}/pywikipedia");
+
+my $count = `ps x | grep python | grep redirect | grep -v grep | wc -l`;
+
+$count *= 1;
+
+if ( !$count ) {
+	fork() and exit();
+	setsid();
+
+	open( STDOUT, '>', "$ENV{HOME}/tools/log/double-redirects.log" ) or die $!;
+	open( STDERR, '>&STDOUT' ) or die $!;
+
+	system('python', 'redirect.py', 'double', '-always', '-family:wikipedia', '-lang:pl');
+	system('python', 'redirect.py', 'double', '-always', '-family:wikisource', '-lang:pl');
+
+	close(STDOUT);
+	close(STDERR);
+}

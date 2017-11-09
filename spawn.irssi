@@ -1,0 +1,20 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Env;
+
+my $pid = 0;
+
+if ( open( PID, '<', "$ENV{HOME}/.irssi/irssi.pid" ) ) {
+	$pid = <PID>;
+	$pid = int($pid);
+	close(PID);
+}
+
+exit(0) if $pid and kill( 'CHLD', $pid );
+
+open( my $log, '>>', "$ENV{HOME}/tools/log/irssi.log" );
+print $log "DAMN! irssi is dead... reviving...\n";
+close($log);
+
+exec( 'screen', '-dmS', 'irssi', 'irssi' ) or die $!;

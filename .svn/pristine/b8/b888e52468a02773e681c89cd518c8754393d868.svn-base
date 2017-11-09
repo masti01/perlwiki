@@ -1,0 +1,34 @@
+CREATE TABLE IF NOT EXISTS projects (
+	project_id INTEGER PRIMARY KEY,
+	project_name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS recentchanges (
+	rc_id INTEGER PRIMARY KEY,
+	rc_project INTEGER NOT NULL REFERENCES projects (project_id),
+	rc_ns INTEGER,
+	rc_title TEXT NOT NULL,
+	rc_oldrevid INTEGER,
+	rc_newrevid INTEGER NOT NULL,
+	rc_user TEXT,
+	rc_timestamp DATE NOT NULL,
+	rc_comment TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS rc_project_newrevid_idx ON recentchanges (rc_project, rc_newrevid);
+CREATE INDEX IF NOT EXISTS rc_timestamp_user_idx ON recentchanges (rc_timestamp, rc_user);
+CREATE INDEX IF NOT EXISTS rc_project_timestamp_idx ON recentchanges (rc_project, rc_timestamp);
+
+CREATE TABLE IF NOT EXISTS abusers (
+	abuser_id INTEGER PRIMARY KEY,
+	abuser_name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS abusers_edits (
+	ae_edit INTEGER PRIMARY KEY REFERENCES recentchanges (rc_id),
+	ae_score INTEGER NULL,
+	ae_abuser INTEGER NULL REFERENCES abusers (abuser_id),
+	ae_confirmed INTEGER NULL
+);
+
+CREATE INDEX IF NOT EXISTS ae_edit_score_idx ON abusers_edits (ae_edit, ae_score);

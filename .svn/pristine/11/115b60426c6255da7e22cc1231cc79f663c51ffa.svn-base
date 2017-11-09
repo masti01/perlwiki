@@ -1,0 +1,240 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Bot4;
+use utf8;
+use Text::Diff;
+use Data::Dumper;
+use ICU::MyCollator;
+use MediaWiki::Parser;
+
+my $logger  = Log::Any::get_logger;
+my $pretend = 0;
+
+my $bot = new Bot4;
+$bot->addOption( "pretend" => \$pretend, "Do not edit wiki page" );
+$bot->single(1);
+$bot->setProject( "wiktionary", "pl" );
+$bot->setup;
+
+my $api = $bot->getApi;
+$api->checkAccount;
+
+my %indexes;
+my %lists;
+my %templates;
+my %locales;
+
+sub fetchOrders {
+	my $response = $api->query(
+		'action' => 'query',
+		'prop'   => 'revisions',
+		'titles' => 'User:Beau.bot/indeksy/lista',
+		'rvprop' => 'content',
+	);
+	my ($page) = values %{ $response->{query}->{pages} };
+	die "Page $page->{title} does not exist\n" unless $page->{revisions};
+	my ($revision) = values %{ $page->{revisions} };
+	my @entries = extract_templates( $revision->{'*'} );
+
+	foreach my $entry (@entries) {
+		if ( $entry->{name} ne 'Wikipedysta:Beau.bot/indeksy/szablon' ) {
+			$logger->info("Ignoring template: $entry->{name}");
+			next;
+		}
+
+		my $title = $entry->{fields}->{'nazwa indeksu'};
+		my $templ = $entry->{fields}->{'szablony tematyczne'};
+		my $langs = $entry->{fields}->{'szablony języków'};
+		my $cats  = $entry->{fields}->{'kategorie'};
+
+		unless ( defined $title and defined $templ and defined $langs ) {
+			$logger->info("Ignoring template: $entry->{name}, missing arguments");
+			next;
+		}
+		my @templates = split /\s*,\s*/, $templ;
+		my @languages = split /\s*,\s*/, $langs;
+		my @categories;
+		push @categories, split /\s*,\s*/, $cats
+		  if defined $cats;
+
+		my %info = (
+			'title'      => ucfirst($title),
+			'templates'  => \@templates,
+			'languages'  => \@languages,
+			'categories' => \@categories,
+		);
+
+		# FIXME
+		if ( exists $indexes{$title} ) {
+			$logger->error("Index name collision: $title");
+			next;
+		}
+		$indexes{$title} = \%info;
+
+		foreach my $language (@languages) {
+			$templates{$language}++;
+			foreach my $template (@templates) {
+				$lists{"$language-$template"} = {};
+				$templates{$template}++;
+			}
+		}
+	}
+	if ( exists $templates{'język polski'} ) {
+		$templates{'termin obcy w języku polskim'}++;
+	}
+}
+
+sub fetchLocales {
+	my $response = $api->query(
+		'action' => 'query',
+		'prop'   => 'revisions',
+		'titles' => 'Wikipedysta:Beau.bot/locale‎',
+		'rvprop' => 'content',
+	);
+	my ($page) = values %{ $response->{query}->{pages} };
+	die "Page $page->{title} does not exist\n" unless $page->{revisions};
+	my ($revision) = values %{ $page->{revisions} };
+
+	my %locales;
+	foreach my $line ( split "\n", $revision->{'*'} ) {
+		next unless $line =~ /^\*\s*(.+?)\s*:\s*(\S+)\s*$/;
+		$locales{$1} = $2;
+	}
+	return %locales;
+}
+
+sub fetchTitles {
+	my %titles;
+	foreach my $template ( sort keys %templates ) {
+		my $iterator = $api->getIterator(
+			'list'        => 'embeddedin',
+			'eititle'     => "Szablon:$template",
+			'eilimit'     => 'max',
+			'einamespace' => NS_MAIN,
+		);
+
+		$logger->debug("Fetching template links to $template");
+
+		while ( my $item = $iterator->next ) {
+			next unless $item->{ns} == NS_MAIN;
+			$titles{ $item->{title} }++;
+		}
+	}
+	return ( sort keys %titles );
+}
+
+sub processPage {
+	my $page       = shift;
+	my ($revision) = values %{ $page->{revisions} };
+	my $content    = $revision->{'*'};
+
+	$logger->trace("Page: $page->{title}");
+
+	$content =~ s/\{\{termin obcy w języku polskim\}\}/{{język polski}}/g;
+
+	foreach my $section ( split /^(?==)/m, $content ) {
+		unless ( $section =~ /^==.+\(\s*\{\{((?:język) +[^{}()\[\]]+)/ ) {
+			next;
+		}
+		my $language = $1;
+		$logger->trace("Section: $language");
+		my @templates = $section =~ /\{\{([^{}\[\]]+)\}\}/g;
+
+		foreach my $template (@templates) {
+			$logger->trace("Template: $template");
+			next unless exists $lists{"$language-$template"};
+			$lists{"$language-$template"}{ $page->{title} }++;
+		}
+	}
+}
+
+sub wiktSort {
+	my $language = lc shift;
+	$language =~ s/^język //;
+
+	my $locale = $locales{$language};
+
+	unless ($locale) {
+		$logger->warn("Unknown language $language");
+		$locale = undef;
+	}
+
+	my $collator;
+
+	eval { $collator = new ICU::MyCollator($locale); };
+	if ($@) {
+		$logger->warn("Unsupported locale: $@");
+		return sort(@_);
+	}
+	else {
+		return sort { $collator->compare( $a, $b ) } @_;
+	}
+}
+
+fetchOrders;
+my @titles = fetchTitles;
+%locales = fetchLocales;
+
+while (@titles) {
+	my @currentTitles = splice( @titles, 0, 50 );
+
+	my $response = $api->query(
+		'titles' => join( "|", @currentTitles ),
+		'prop'   => 'revisions|info',
+		'rvprop' => 'content',
+	);
+
+	foreach my $page ( values %{ $response->{query}->{pages} } ) {
+		processPage($page);
+	}
+
+	#last;
+}
+
+foreach my $index ( values %indexes ) {
+	foreach my $language ( @{ $index->{languages} } ) {
+		my $language2 = $language;
+		$language2 =~ s/^język //;
+
+		my $title = "Indeks:" . ucfirst $language2 . " - " . $index->{title};
+		my %list;
+
+		foreach my $template ( @{ $index->{templates} } ) {
+			my @list = keys %{ $lists{"$language-$template"} };
+			foreach my $item (@list) {
+				$list{ substr $item, 0, 1 }{$item}++;
+			}
+		}
+
+		my $content = << "EOF";
+{{język linków|$language2}}<div style="clear:right; margin-bottom: .5em; float: right; padding: .5em 0 .8em 1.4em;">__TOC__</div>
+
+EOF
+
+		foreach my $letter ( wiktSort( $language, keys %list ) ) {
+			$content .= "\n=== $letter ===\n";
+			$content .= "[[" . join( "]] • [[", wiktSort( $language, keys %{ $list{$letter} } ) ) . "]]\n";
+		}
+
+		$content .= "\n";
+		$content .= "\n[[Kategoria:Słowniki tworzone automatycznie|{{PAGENAME}}]]";
+		$content .= "\n[[Kategoria:" . ucfirst($language2) . " (słowniki tematyczne)|$index->{title}]]";
+
+		foreach my $category ( @{ $index->{categories} } ) {
+			$content .= "\n[[Kategoria:$category|{{PAGENAME}}]]";
+		}
+
+		$api->edit(
+			title    => $title,
+			text     => $content,
+			summary  => "utworzenie indeksu",
+			notminor => 1,
+
+			#bot      => 1,
+		);
+
+	}
+}
+
+# perltidy -et=8 -l=0 -i=8

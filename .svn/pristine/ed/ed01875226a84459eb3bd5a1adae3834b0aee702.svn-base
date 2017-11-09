@@ -1,0 +1,339 @@
+#!/usr/bin/perl -w
+
+use strict;
+use utf8;
+use Bot4;
+use Data::Dumper;
+use POSIX;
+use Wiki::Votes;
+use WWW;
+use Log::Any;
+
+my $bot = new Bot4;
+$bot->single(1);
+$bot->setProject( "wikipedia", "pl" );
+$bot->setup;
+
+my $logger = Log::Any->get_logger;
+$logger->info("Start");
+
+my $api = $bot->getApi;
+$api->checkAccount;
+
+my $vars = {};
+
+sub removePrefix($$) {
+	my ( $title, $prefix ) = @_;
+
+	$prefix .= '/';
+	my $extractedPrefix = substr( $title, 0, length($prefix), '' );
+	die unless $extractedPrefix eq $prefix;
+	return $title;
+}
+
+eval {
+	my @time = localtime(time);
+	my $electionMonth;
+	my $electionYear = $time[5] + 1900;
+	my $electedPeople;
+
+	if ( $time[7] > 182 ) {
+		$electionMonth = 9;
+		$electedPeople = 5;
+	}
+	else {
+		$electionMonth = 3;
+		$electedPeople = 4;
+	}
+
+	my $ts = sprintf( "%04d-%02d", $electionYear, $electionMonth );
+
+	$vars->{ka}->{page} = "Wikipedia:Komitet Arbitrażowy/Wybór członków/$ts";
+
+	my $page_prefix = "Wikipedia:Komitet Arbitrażowy/Wybór członków/$ts";
+	my $re          = qr/====\s*Za\s*:?\s*====(.*?)====\s*Przeciw\s*:?\s*====(.*?)====\s*Wstrzymuję\s*się\s*:?\s*====(.*?)===/si;
+
+	my @pages;
+	if ( $time[4] + 1 == $electionMonth ) {
+		@pages = get_subpages( $api, "Wikipedia:Komitet Arbitrażowy/Wybór członków/$ts/Całość", $page_prefix );
+	}
+
+	if ( scalar @pages ) {
+		my @rows;
+		foreach my $page ( get_results( $api, $re, @pages ) ) {
+			my %row;
+			$row{page} = $page->{title};
+			$row{subpage} = removePrefix( $page->{title}, $page_prefix );
+
+			( $row{za}, $row{przeciw}, $row{wstrz} ) = map { scalar( @{$_} ) } @{ $page->{values} };
+
+			unless ( defined $row{wstrz} ) {
+				$row{error} = 'nie można odczytać danych';
+			}
+			else {
+				$row{netto} = $row{za} - $row{przeciw};
+			}
+			push @rows, \%row;
+		}
+		@rows = sort { $b->{netto} <=> $a->{netto} or $a->{przeciw} <=> $b->{przeciw} } @rows;
+
+		for ( my $i = 0 ; $i < $electedPeople ; $i++ ) {
+			$rows[$i]->{color} = 'lightgreen';
+		}
+
+		my $lastNetto = $rows[ $electedPeople - 1 ]->{netto};
+
+		if ( $lastNetto == $rows[$electedPeople]->{netto} ) {
+			foreach my $row (@rows) {
+				if ( $row->{netto} == $lastNetto ) {
+					$row->{color} = 'lightblue';
+				}
+			}
+		}
+
+		$vars->{ka}->{rows} = \@rows;
+	}
+};
+if ($@) {
+	$vars->{ka}->{error} = "Wystąpił błąd podczas pobierania danych: $@";
+}
+
+eval {
+	$vars->{pu}->{title} = 'Przyznawanie uprawnień';
+	$vars->{pu}->{page}  = 'Wikipedia:Przyznawanie uprawnień';
+
+	my $page_prefix = 'Wikipedia:Przyznawanie uprawnień';
+	my $re          = qr/====\s*Za\s*:?\s*====(.*?)====\s*Przeciw\s*:?\s*====(.*?)====\s*Wstrzymuję\s*się\s*:?\s*====(.*?)===/si;
+
+	my @pages = get_subpages( $api, $page_prefix, $page_prefix, 'Wstęp' );
+
+	if ( scalar @pages ) {
+		my @rows;
+		foreach my $page ( get_results( $api, $re, @pages ) ) {
+			my %row;
+			$row{page}    = $page->{title};
+			$row{subpage} = removePrefix( $page->{title}, $page_prefix );
+			$row{date}    = '?';
+
+			( $row{za}, $row{przeciw}, $row{wstrz} ) = map { scalar( @{$_} ) } @{ $page->{values} };
+
+			unless ( defined $row{wstrz} ) {
+				$row{error} = 'nie można odczytać danych';
+			}
+			else {
+				$row{all}     = $row{za} + $row{przeciw};
+				$row{percent} = $row{all} ? int( $row{za} / $row{all} * 100 ) : '';
+				$row{netto}   = $row{za} - $row{przeciw};
+
+				if ( exists $page->{finish} ) {
+					$row{date} = strftime( "%Y-%m-%d %H:%M:%S", gmtime( $page->{finish} ) );
+				}
+			}
+			push @rows, \%row;
+		}
+		@rows = sort { $a->{date} cmp $b->{date} } @rows;
+		$vars->{pu}->{rows} = \@rows;
+	}
+};
+if ($@) {
+	$vars->{pu}->{error} = "Wystąpił błąd podczas pobierania danych: $@";
+}
+
+eval {
+	$vars->{pdda}->{title} = 'Propozycje do Dobrych Artykułów';
+	$vars->{pdda}->{page}  = 'Wikipedia:Propozycje do Dobrych Artykułów';
+
+	my $page_prefix = 'Wikipedia:Propozycje do Dobrych Artykułów';
+	my $re          = qr/\n;\s*Sprawdzone przez\s*\n(.+?)(?:\n;|$)/si;
+	my @pages       = get_subpages( $api, $page_prefix, $page_prefix, 'przyznawanie', 'odbieranie' );
+
+	if ( scalar @pages ) {
+		my @rows;
+		foreach my $page ( get_results( $api, $re, @pages ) ) {
+			my %row;
+			$row{page}     = $page->{title};
+			$row{subpage}  = removePrefix( $page->{title}, $page_prefix );
+			$row{date}     = '?';
+			$row{checkers} = '?';
+
+			my ($checkers) = map { scalar( @{$_} ) } @{ $page->{values} };
+			$row{checkers} = $checkers
+			  if defined $checkers;
+
+			if ( exists $page->{finish} ) {
+				$row{date} = strftime( "%Y-%m-%d %H:%M:%S", gmtime( $page->{finish} ) );
+			}
+			push @rows, \%row;
+		}
+		@rows = sort { $a->{date} cmp $b->{date} } @rows;
+		$vars->{pdda}->{rows} = \@rows;
+	}
+};
+if ($@) {
+	$vars->{pdda}->{error} = "Wystąpił błąd podczas pobierania danych: $@";
+}
+
+eval {
+	$vars->{panm}->{title} = 'Propozycje do Artykułów na medal';
+	$vars->{panm}->{page}  = 'Wikipedia:Propozycje do Artykułów na medal';
+
+	my $page_prefix = 'Wikipedia:Propozycje do Artykułów na medal';
+	my $re          = qr/\n=+\s*Sprawdzone przez\s*=+\n(.+?)(?:\n=|$)/si;
+
+	my @pages = get_subpages( $api, $page_prefix, $page_prefix, 'przyznawanie', 'odbieranie' );
+
+	if ( scalar @pages ) {
+		my @rows;
+		foreach my $page ( get_results( $api, $re, @pages ) ) {
+			my %row;
+			$row{page}     = $page->{title};
+			$row{subpage}  = removePrefix( $page->{title}, $page_prefix );
+			$row{date}     = '?';
+			$row{checkers} = '?';
+
+			my ($checkers) = map { scalar( @{$_} ) } @{ $page->{values} };
+			$row{checkers} = $checkers
+			  if defined $checkers;
+
+			if ( exists $page->{finish} ) {
+				$row{date} = strftime( "%Y-%m-%d %H:%M:%S", gmtime( $page->{finish} ) );
+			}
+			push @rows, \%row;
+		}
+		@rows = sort { $a->{date} cmp $b->{date} } @rows;
+		$vars->{panm}->{rows} = \@rows;
+	}
+};
+if ($@) {
+	$vars->{panm}->{error} = "Wystąpił błąd podczas pobierania danych: $@";
+}
+
+eval {
+	$vars->{gnm}->{title} = 'Ilustracja na medal';
+	$vars->{gnm}->{page}  = 'Wikipedia:Ilustracja na medal - propozycje';
+
+	my $page_prefix = 'Wikipedia:Ilustracja na medal - propozycje';
+	my $re          = qr/\*\s*'''Głosy za:'''(.*?)\*\s*'''Głosy przeciw:'''(.+?)\*\s*'''Dyskusja:'''/si;
+
+	my @pages = get_subpages( $api, $page_prefix, $page_prefix, 'Instrukcja', 'Zasady' );
+
+	if ( scalar @pages ) {
+		my @rows;
+		foreach my $page ( get_results( $api, $re, @pages ) ) {
+			my %row;
+			$row{page}    = $page->{title};
+			$row{subpage} = removePrefix( $page->{title}, $page_prefix );
+			$row{date}    = '?';
+
+			( $row{za}, $row{przeciw} ) = map { scalar( @{$_} ) } @{ $page->{values} };
+
+			unless ( defined $row{przeciw} ) {
+				$row{error} = 'nie można odczytać danych';
+			}
+			else {
+				$row{all}     = $row{za} + $row{przeciw};
+				$row{percent} = $row{all} ? int( $row{za} / $row{all} * 100 ) : '';
+				$row{netto}   = $row{za} - $row{przeciw};
+
+				if ( exists $page->{finish} ) {
+					$row{date} = strftime( "%Y-%m-%d %H:%M:%S", gmtime( $page->{finish} ) );
+				}
+			}
+			push @rows, \%row;
+		}
+		@rows = sort { $a->{date} cmp $b->{date} } @rows;
+		$vars->{gnm}->{rows} = \@rows;
+	}
+};
+if ($@) {
+	$vars->{gnm}->{error} = "Wystąpił błąd podczas pobierania danych: $@";
+}
+
+eval {
+	$vars->{plnm}->{title} = 'Propozycje do List na medal';
+	$vars->{plnm}->{page}  = 'Wikipedia:Propozycje do List na medal';
+
+	my $page_prefix = 'Wikipedia:Propozycje do List na medal';
+	my $re          = qr/\*\s*'''Głosy za:'''(.*?)\*\s*'''Głosy przeciw:'''(.+?)\*\s*'''Dyskusja:'''/si;
+
+	my @pages = get_subpages( $api, $page_prefix, $page_prefix );
+
+	if ( scalar @pages ) {
+		my @rows;
+		foreach my $page ( get_results( $api, $re, @pages ) ) {
+			my %row;
+			$row{page}    = $page->{title};
+			$row{subpage} = removePrefix( $page->{title}, $page_prefix );
+			$row{date}    = '?';
+
+			( $row{za}, $row{przeciw} ) = map { scalar( @{$_} ) } @{ $page->{values} };
+
+			unless ( defined $row{przeciw} ) {
+				$row{error} = 'nie można odczytać danych';
+			}
+			else {
+				$row{all}     = $row{za} + $row{przeciw};
+				$row{percent} = $row{all} ? int( $row{za} / $row{all} * 100 ) : '';
+				$row{netto}   = $row{za} - $row{przeciw};
+
+				if ( exists $page->{finish} ) {
+					$row{date} = strftime( "%Y-%m-%d %H:%M:%S", gmtime( $page->{finish} ) );
+				}
+			}
+			push @rows, \%row;
+		}
+		@rows = sort { $a->{date} cmp $b->{date} } @rows;
+		$vars->{plnm}->{rows} = \@rows;
+	}
+};
+if ($@) {
+	$vars->{plnm}->{error} = "Wystąpił błąd podczas pobierania danych: $@";
+}
+
+eval {
+	$vars->{pdga}->{title} = 'Propozycje do Grup Artykułów';
+	$vars->{pdga}->{page}  = 'Wikipedia:Propozycje do Grup Artykułów';
+
+	my $page_prefix = 'Wikipedia:Propozycje do Grup Artykułów';
+	my $re          = qr/\*\s*'''Głosy za:'''(.*?)\*\s*'''Głosy przeciw:'''(.+?)\*\s*'''Dyskusja:'''/si;
+
+	my @pages = get_subpages( $api, $page_prefix, $page_prefix, 'tabelka' );
+
+	if ( scalar @pages ) {
+		my @rows;
+		foreach my $page ( get_results( $api, $re, @pages ) ) {
+			my %row;
+			$row{page}    = $page->{title};
+			$row{subpage} = removePrefix( $page->{title}, $page_prefix );
+			$row{date}    = '?';
+
+			( $row{za}, $row{przeciw} ) = map { scalar( @{$_} ) } @{ $page->{values} };
+
+			unless ( defined $row{przeciw} ) {
+				$row{error} = 'nie można odczytać danych';
+			}
+			else {
+				$row{all}     = $row{za} + $row{przeciw};
+				$row{percent} = $row{all} ? int( $row{za} / $row{all} * 100 ) : '';
+				$row{netto}   = $row{za} - $row{przeciw};
+
+				if ( exists $page->{finish} ) {
+					$row{date} = strftime( "%Y-%m-%d %H:%M:%S", gmtime( $page->{finish} ) );
+				}
+			}
+			push @rows, \%row;
+		}
+		@rows = sort { $a->{date} cmp $b->{date} } @rows;
+		$vars->{pdga}->{rows} = \@rows;
+	}
+};
+if ($@) {
+	$vars->{pdga}->{error} = "Wystąpił błąd podczas pobierania danych: $@";
+}
+
+$logger->info("Zapis listy");
+
+#print Dumper $vars;
+writeFile( 'var/votes.html', WWW::render( 'votes.tt', $vars ) );
+
+# perltidy -et=8 -l=0 -i=8

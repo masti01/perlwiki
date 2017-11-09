@@ -1,0 +1,237 @@
+#!/usr/bin/perl -w
+
+use strict;
+use utf8;
+use Bot4;
+use Log::Any;
+use Data::Dumper;
+
+my $logger = Log::Any->get_logger();
+my $bot    = new Bot4;
+$bot->single(1);
+$bot->setProject( "wikisource", "pl" );
+$bot->setup;
+
+my $api = $bot->getApi;
+$api->checkAccount;
+
+my @ns = (    #
+	[ NS_PROJECT,  'User:Beau.bot/listy/meta' ],
+	[ NS_HELP,     'User:Beau.bot/listy/pomoc' ],
+	[ NS_FILE,     'User:Beau.bot/listy/pliki' ],
+	[ NS_CATEGORY, 'User:Beau.bot/listy/kategorie' ],
+);
+
+sub listTemplates {
+	my $iterator = $api->getIterator(
+		'action'       => 'query',
+		'generator'    => 'allpages',
+		'prop'         => 'categories|info',
+		'cllimit'      => 'max',
+		'gaplimit'     => '50',
+		'gapnamespace' => NS_TEMPLATE,
+
+		#'maxage'  => 1800,
+	);
+
+	my %templates;
+	my %documentation;
+
+	while ( my $item = $iterator->next ) {
+		$item->{title} =~ s/^Szablon://;
+		$item->{categories} = $item->{categories} ? { map { $_->{title} => 1 } values %{ $item->{categories} } } : {};
+
+		if ( $item->{title} =~ m{/opis$} ) {
+			$documentation{ $item->{title} } = $item;
+		}
+		elsif ( $item->{categories}->{'Opisy szablonów'} ) {
+			$documentation{ $item->{title} } = $item;
+		}
+		else {
+			$templates{ $item->{title} } = $item;
+		}
+	}
+
+	my %list;
+	foreach my $name ( keys %templates ) {
+		my %info = (
+			'template'      => $templates{$name},
+			'documentation' => undef,
+		);
+
+		my $response = $api->query(
+			'action'  => 'query',
+			'prop'    => 'templates',
+			'titles'  => "Szablon:$name",
+			'tllimit' => 'max',
+			'list'    => 'backlinks|embeddedin',
+			'bltitle' => "Szablon:$name",
+			'eititle' => "Szablon:$name",
+			'bllimit' => 25,
+			'eilimit' => 25,
+
+			#'maxage'  => 1800,
+		);
+		my %backlinks = map { $_->{title} => 1 } values %{ $response->{query}->{backlinks} };
+		delete $backlinks{'Wikiskryba:Beau.bot/listy/szablony'};
+		delete $backlinks{'Wikipedysta:Beau.bot/listy/szablony'};
+		delete $backlinks{"Szablon:$name"};
+
+		$info{backlinks} = scalar keys %backlinks;
+
+		my %embeddedin = map { $_->{title} => 1 } values %{ $response->{query}->{embeddedin} };
+		delete $embeddedin{"Szablon:$name"};
+
+		$info{embeddedin} = scalar keys %embeddedin;
+
+		my ($page) = values %{ $response->{query}->{pages} };
+		my %templates = map { $_->{title} => 1 } values %{ $page->{templates} };
+		my @documentation;
+
+		foreach my $template (%templates) {
+			next unless $template =~ s/^Szablon://;
+
+			if ( exists $documentation{$template} ) {
+				push @documentation, $template;
+			}
+		}
+
+		if ( @documentation == 1 ) {
+			$info{documentation} = $documentation{ shift @documentation };
+		}
+		elsif ( @documentation > 1 ) {
+			local $" = ', ';
+			$logger->warn("Nie można jednoznacznie określić dokumentacji szablonu $page->{title}: @documentation");
+		}
+		else {
+
+			# Fallback
+			if ( exists $documentation{"$page->{title}/opis"} ) {
+				$info{documentation} = $documentation{"$page->{title}/opis"};
+			}
+		}
+
+		$list{$name} = \%info;
+	}
+
+	my $report = << 'EOF';
+{| class="wikitable sortable"
+! nazwa
+! dokumentacja
+! osadzeń
+! linków
+! kategorie
+EOF
+
+	foreach my $name ( sort keys %list ) {
+		my $info = $list{$name};
+		if ( exists $info->{template}->{redirect} ) {
+			$report .= "|- style=\"background-color: lightgray\"\n";
+		}
+		else {
+			$report .= "|-\n";
+		}
+		$report .= "| [[:Szablon:$info->{template}->{title}|]]\n";
+		if ( $info->{documentation} ) {
+			$report .= "| style=\"background-color:lightgreen\" | [[Szablon:$info->{documentation}->{title}|tak]]\n";
+		}
+		else {
+			$report .= "| nie\n";
+		}
+		if ( $info->{embeddedin} < 3 and !exists $info->{template}->{redirect} ) {
+			$report .= "| style=\"background-color:lightPink\" | $info->{embeddedin}\n";
+		}
+		elsif ( $info->{embeddedin} > 20 ) {
+			$report .= "| 20+\n";
+		}
+		else {
+			$report .= "| $info->{embeddedin}\n";
+		}
+
+		if ( $info->{backlinks} > 20 ) {
+			$report .= "| 20+\n";
+		}
+		else {
+			$report .= "| $info->{backlinks}\n";
+		}
+
+		my @categories = sort keys %{ $info->{template}->{categories} };
+
+		if (@categories) {
+			my @links = map { my $title = $_; $title =~ s/^Kategoria://; "[[:$_|$title]]" } @categories;
+			local $" = ",\n* ";
+			$report .= "|\n* @links\n";
+		}
+		elsif ( exists $info->{template}->{redirect} ) {
+			$report .= "| brak\n";
+		}
+		else {
+			$report .= "| style=\"background-color:lightPink\" | brak\n";
+		}
+	}
+	$report .= "|}";
+
+	$api->edit(
+		'title' => 'User:Beau.bot/listy/szablony',
+		'text'  => $report,
+	);
+}
+
+sub listPages($) {
+	my ( $namespace, $title ) = @{ shift @_ };
+	my @list;
+	my $iterator = $api->getIterator(    #
+		'action'       => 'query',
+		'generator'    => 'allpages',
+		'prop'         => 'categories|info',
+		'cllimit'      => 'max',
+		'gaplimit'     => '50',
+		'gapnamespace' => $namespace,
+	);
+	while ( my $item = $iterator->next ) {
+		push @list, $item;
+	}
+
+	my $report = << 'EOF';
+{| class="wikitable sortable"
+! nazwa
+! kategorie
+EOF
+
+	foreach my $page ( sort { $a->{title} cmp $b->{title} } @list ) {
+		if ( exists $page->{redirect} ) {
+			$report .= "|- style=\"background-color: lightgray\"\n";
+		}
+		else {
+			$report .= "|-\n";
+		}
+
+		$report .= "| [[:$page->{title}]]\n";
+
+		my @categories = map { $_->{title} } values %{ $page->{categories} };
+
+		if (@categories) {
+			my @links = map { my $title = $_; $title =~ s/^Kategoria://; "[[:$_|$title]]" } @categories;
+			local $" = ",\n* ";
+			$report .= "|\n* @links\n";
+		}
+		elsif ( exists $page->{redirect} ) {
+			$report .= "| brak\n";
+		}
+		else {
+			$report .= "| style=\"background-color:lightPink\" | brak\n";
+		}
+	}
+	$report .= "|}";
+
+	$api->edit(
+		'title' => $title,
+		'text'  => $report,
+	);
+}
+
+foreach my $task (@ns) {
+	listPages($task);
+}
+
+listTemplates;

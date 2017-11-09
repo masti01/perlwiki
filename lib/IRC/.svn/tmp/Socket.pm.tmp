@@ -1,0 +1,187 @@
+package IRC::Socket;
+use strict;
+use base 'IRC::EventSource';
+use IO::Select;
+
+my $socketPackage;
+
+BEGIN {
+	my $ipv6 = eval 'use IO::Socket::INET6; 1;';
+	if ($ipv6) {
+		require IO::Socket::INET6;
+		$socketPackage = 'IO::Socket::INET6';
+	}
+	else {
+		require IO::Socket::INET;
+		$socketPackage = 'IO::Socket::INET';
+	}
+}
+
+sub new {
+	my $caller = shift;
+	my $class = ref($caller) || $caller;
+
+	my $this = $class->SUPER::new(
+		'pingFreq' => 60,
+		'logger'   => sub { },
+		@_
+	);
+
+	bless $this, $class;
+	$this->registerHandler( 'raw',   \&_raw );
+	$this->registerHandler( 'PING',  \&_ping );
+	$this->registerHandler( 'PONG',  \&_pong );
+	$this->registerHandler( 'ERROR', \&_error );
+	return $this;
+}
+
+sub _createSocket {
+	my $this = shift;
+	$this->{socket} = $socketPackage->new(
+		'PeerAddr' => $this->{server},
+		'Proto'    => 'tcp',
+	) or die "$!\n";
+}
+
+sub connect {
+	my $this = shift;
+	my $server = shift || $this->{server};
+	$this->{server} = $server;
+
+	$this->_createSocket
+	  unless defined $this->{socket};
+
+	$this->{select} = IO::Select->new( $this->{socket} )
+	  unless defined $this->{select};
+
+	$this->{socket}->autoflush(1);
+	$this->{buffer}   = '';
+	$this->{nextPing} = time + $this->{pingFreq};
+	$this->{pingSent} = 0;
+
+	$this->log( "STATUS", "connected" );
+
+	$this->invokeHandler( 'event' => 'connected' );
+}
+
+sub disconnect {
+	my $this = shift;
+	my $msg  = shift;
+	return unless defined $this->{socket};
+	$this->log( "STATUS", "disconnected" );
+	close( $this->{socket} );
+	$this->{socket} = undef;
+	$this->{select} = undef;
+	$this->invokeHandler(
+		'event'   => 'disconnected',
+		'message' => $msg,
+	);
+}
+
+sub socket {
+	my $this = shift;
+	$this->{socket};
+}
+
+sub connected {
+	my $this = shift;
+	return ( defined $this->{socket} ? 1 : 0 );
+}
+
+sub handle {
+	my $this    = shift;
+	my $timeout = shift;
+	$timeout |= 0;
+
+	if ( $this->{select}->can_read($timeout) ) {
+		my $buf;
+		my $r = $this->{socket}->recv( $buf, 5120 );
+		if ( !defined $r ) {
+			$this->disconnect("Read error: $!");
+			return;
+		}
+		if ( !defined $buf or $buf eq '' ) {
+			$this->disconnect("Read error, empty buffer: $!");
+			return;
+		}
+		$this->{buffer} .= $buf;
+
+		while ( $this->{buffer} =~ m/^(.*?)\r\n(.*)$/s ) {
+			my $line = $1;
+			$this->{buffer} = $2;
+
+			next if $line eq '';
+
+			$this->invokeHandler(
+				'event'   => 'raw',
+				'content' => $line,
+			);
+			if ( $line =~ m/^(?::(\S+)\s)?(\S+)(?:\s(.+))?$/ ) {
+
+				# prefix, cmd, args
+				$this->invokeHandler(
+					'event'   => $2,
+					'prefix'  => $1,
+					'content' => $3,
+				);
+			}
+		}
+	}
+
+	# check pings
+	my $time = time;
+	if ( $this->{nextPing} < $time ) {
+		if ( $this->{pingSent} ) {
+			$this->disconnect("Ping timeout");
+			return;
+		}
+		else {
+			$this->send( "PING :" . $time );
+			$this->{pingSent} = $time;
+			$this->{nextPing} = $time + $this->{pingFreq};
+		}
+	}
+	return 1;
+}
+
+sub log {
+	&{ $_[0]->{logger} }(@_);
+}
+
+sub send {
+	my $this = shift;
+	return unless $this->connected;
+
+	foreach my $line (@_) {
+		$this->{socket}->send( $line . "\r\n" );
+		$this->log( "SEND", $line );
+	}
+}
+
+# Event handlers
+
+sub _ping {
+	my ( $this, $data ) = @_;
+	$this->send("PONG $data->{content}");
+}
+
+sub _pong {
+	my $this = shift;
+
+	$this->{nextPing} = time() + $this->{pingFreq};
+	$this->{pingSent} = 0;
+}
+
+sub _error {
+	my ( $this, $data ) = @_;
+	$this->disconnect( $data->{content} );
+}
+
+sub _raw {
+	my ( $this, $data ) = @_;
+	$this->log( "RECV", $data->{content} );
+}
+
+1;
+
+# perltidy -et=8 -l=0 -i=8

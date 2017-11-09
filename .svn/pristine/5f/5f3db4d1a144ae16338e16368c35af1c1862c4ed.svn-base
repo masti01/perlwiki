@@ -1,0 +1,215 @@
+#!/usr/bin/perl -w
+
+use strict;
+use utf8;
+use Bot4;
+use Data::Dumper;
+use Text::Diff;
+
+my $ask = 0;
+
+my $logger = Log::Any::get_logger;
+$logger->info("Start");
+
+my $bot = new Bot4;
+$bot->addOption( "ask|a" => \$ask, "Asks for confirmation before deletion" );
+$bot->single(1);
+$bot->setup;
+
+my $api = $bot->getApi( "wikipedia", "pl" );
+$api->checkAccount;
+
+my $apiSysop = $bot->getApi( "wikipedia", "pl", "sysop" );
+$apiSysop->checkAccount;
+
+my @queue;
+
+sub ask() {
+	return 1 unless $ask;
+	print "Czy chcesz kontynuować? ";
+	my $reply = <STDIN>;
+
+	return 1 if $reply =~ /^[TY]/i;
+	return 0;
+}
+
+sub dequeue() {
+	$api->checkAccount;
+	$apiSysop->checkAccount;
+
+	my %infoboxes = map { $_->{title} => $_->{infoboxes} } splice( @queue, 0, 10 );
+	my @titles = keys %infoboxes;
+
+	local $" = ', ';
+	$logger->debug("Sprawdzanie zawartości stron: @titles");
+
+	eval {
+		my $response = $api->query(
+			'titles'  => join( '|', @titles ),
+			'prop'    => 'revisions|info',
+			'intoken' => 'edit',
+			'rvprop'  => 'content|timestamp',
+
+			#'maxlag'  => 20,
+		);
+
+		foreach my $page ( values %{ $response->{query}->{pages} } ) {
+			my ($revision) = values %{ $page->{revisions} };
+			my $content = $revision->{'*'};
+
+			unless ( $content =~ s/\{\{bez infobo(?:ks|x)u(?:\|(?:1=)?([^\{\}]+))?\}\}\s*//i ) {
+				$logger->info("Nie udało się odnaleźć szablonu na stronie [[$page->{title}]]");
+				next;
+			}
+
+			if ( defined $1 ) {
+				my $infobox = ucfirst($1) . " infobox";
+				unless ( exists $infoboxes{ $page->{title} }{"Szablon:$infobox"} ) {
+					my $info;
+					if ( scalar keys %{ $infoboxes{ $page->{title} } } ) {
+						$info = "używane szablony: " . join( ', ', map { s/^Szablon://; $_; } sort keys %{ $infoboxes{ $page->{title} } } );
+					}
+					else {
+						$info = 'brak szablonów';
+					}
+
+					$logger->info("[[$page->{title}]] Potrzeba {{$infobox}}, $info");
+					next;
+				}
+			}
+			else {
+				$logger->info("[[$page->{title}]] Nie zdefiniowano jaki infoboks ma zostać wstawiony");
+			}
+
+			$content =~ s/\s*==\s*bez\s*infoboksu\s*==\s*//;
+
+			if ( $content =~ /^\s*$/ ) {
+				$logger->info("Strona [[$page->{title}]] po usunięciu szablonu pozostanie pusta");
+
+				my $data = $apiSysop->query(
+					'titles'  => $page->{title},
+					'prop'    => 'revisions|info',
+					'intoken' => 'delete',
+					'rvprop'  => 'ids',
+					'rvlimit' => 2,
+
+					#'maxlag'  => 20,
+				);
+
+				my ($p) = values %{ $data->{query}->{pages} };
+
+				#print Dumper($p);
+
+				my $count = scalar keys %{ $p->{revisions} };
+				if ( $count > 1 ) {
+					$logger->info("Strona [[$page->{title}]] ma kilka wersji");
+					$content = "{{ek|infoboks został wstawiony, po usunięciu szablonu strona dyskusji pozostanie pusta - sprawdź historię, bo ma kilka wersji}}";
+					print diff( \$revision->{'*'}, \$content ) . "\n";
+
+					next unless ask;
+
+					$api->edit(
+						title          => $page->{title},
+						token          => $page->{edittoken},
+						starttimestamp => $page->{starttimestamp},
+						basetimestamp  => $revision->{timestamp},
+						text           => $content,
+						bot            => 1,
+						summary        => "artykuł posiada infobox, usunięcie {{[[Template:Bez infoboksu|Bez infoboksu]]}}, wstawienie {{[[Template:Ek|ek]]}}",
+						notminor       => 1,
+					);
+				}
+				else {
+					$logger->info("Kasowanie strony [[$page->{title}]]");
+
+					next unless ask;
+
+					$apiSysop->delete(
+						'title'  => $page->{title},
+						'reason' => "infoboks został wstawiony",
+						'token'  => $p->{deletetoken},
+					);
+				}
+
+			}
+			else {
+				$logger->info("Strona [[$page->{title}]] po usunięciu szablonu nie zostaje pusta");
+				print diff( \$revision->{'*'}, \$content ) . "\n";
+
+				next unless ask;
+
+				$api->edit(
+					title          => $page->{title},
+					token          => $page->{edittoken},
+					starttimestamp => $page->{starttimestamp},
+					basetimestamp  => $revision->{timestamp},
+					text           => $content,
+					bot            => 1,
+					summary        => "artykuł posiada infobox, usunięcie {{[[Template:Bez infoboksu|Bez infoboksu]]}}",
+					notminor       => 1,
+				);
+			}
+		}
+	};
+	if ($@) {
+		$logger->warn("Usunięcie szablonu się nie powiodło: $@");
+	}
+}
+
+my $iterator = $apiSysop->getIterator(
+	'list'        => 'embeddedin',
+	'eititle'     => 'Template:Bez infoboksu',
+	'eilimit'     => 'max',
+	'einamespace' => 1,
+
+	#'maxlag'      => 20,
+);
+
+while (1) {
+	my @titles;
+	my $cnt = 10;
+
+	while ( $cnt and my $item = $iterator->next ) {
+		push @titles, $item->{title};
+		$cnt--;
+	}
+
+	last unless @titles;
+
+	local $" = ', ';
+	$logger->debug("Sprawdzanie szablonów na stronach: @titles");
+
+	my $data = $api->query(
+		'titles' => join( '|', map { s/^Dyskusja:// or die; $_; } @titles ),
+		'prop' => 'templates',
+		'tllimit' => 'max',
+
+		#'maxlag'  => 20,
+	);
+
+	foreach my $page ( values %{ $data->{query}->{pages} } ) {
+		my %infoboxes;
+		foreach my $template ( values %{ $page->{templates} } ) {
+			if ( $template->{title} =~ / infobox$/ ) {
+				$infoboxes{ $template->{title} } = $template;
+			}
+		}
+		next unless scalar keys %infoboxes;
+		$logger->info("Strona [[$page->{title}]] ma infoboks");
+		push @queue,
+		  {
+			'title'     => 'Dyskusja:' . $page->{title},
+			'infoboxes' => \%infoboxes,
+		  };
+	}
+
+	while ( @queue > 10 ) {
+		dequeue;
+	}
+}
+
+while (@queue) {
+	dequeue;
+}
+
+# perltidy -et=8 -l=0 -i=8

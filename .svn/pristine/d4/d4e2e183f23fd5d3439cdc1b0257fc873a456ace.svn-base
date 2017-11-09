@@ -1,0 +1,211 @@
+#!/usr/bin/perl -w
+
+use strict;
+use utf8;
+use Bot4;
+use Log::Any;
+use Data::Dumper;
+use RipeInetnumDb;
+use DBI;
+use URI::Escape qw(uri_escape_utf8);
+use Abuse::WikingerDetector;
+use RevisionCache;
+
+my $db        = 'var/rc.sqlite';
+my $recompute = 0;
+
+my $bot = new Bot4;
+$bot->single(1);
+$bot->addOption( "database=s", \$db,        "Changes path to a database" );
+$bot->addOption( "recompute",  \$recompute, "Recomputes the edit scoring" );
+$bot->setup;
+
+my $logger = Log::Any->get_logger();
+
+my $ripeDb = new RipeInetnumDb(    #
+	'index'    => 'var/ripe.db.inetnum.index',
+	'database' => 'var/ripe.db.inetnum',
+);
+
+my $detector = new Abuse::WikingerDetector;
+
+my $dbh = DBI->connect( "dbi:SQLite:dbname=$db", "", "", { RaiseError => 1, PrintError => 0, sqlite_use_immediate_transaction => 1 } );
+
+$dbh->do("INSERT OR IGNORE INTO abusers VALUES (1, 'Wikinger')");
+
+sub getProjects {
+	my $selectProjects = $dbh->prepare("SELECT project_id id, project_name name FROM projects");
+	$selectProjects->execute();
+	my @result;
+	while ( my $row = $selectProjects->fetchrow_hashref ) {
+		push @result, $row;
+	}
+	return @result;
+}
+
+my $selectEdits;
+
+if ($recompute) {
+	$selectEdits = $dbh->prepare("SELECT * FROM recentchanges WHERE rc_project = ? ORDER BY rc_timestamp DESC");
+
+}
+else {
+	$selectEdits = $dbh->prepare("SELECT * FROM recentchanges LEFT JOIN abusers_edits ON (rc_id = ae_edit) WHERE ae_score IS NULL AND rc_project = ?");
+}
+
+my $updateScore    = $dbh->prepare("UPDATE abusers_edits SET ae_score = ? WHERE ae_edit = ?");
+my $insertScore    = $dbh->prepare("INSERT INTO abusers_edits VALUES (?, ?, ?, ?)");
+my $updateOldrevid = $dbh->prepare("UPDATE recentchanges SET rc_oldrevid = ? WHERE rc_id = ?");
+
+foreach my $project ( getProjects() ) {
+	$logger->info("Checking edits on $project->{name}...");
+
+	my ( $lang, $family ) = $project->{name} =~ /^([^\.]+)\.(.+)$/;
+
+	my $api;
+
+	my $cache = new RevisionCache( 'project' => $project->{name}, );
+
+	my $cnt = 0;
+	$dbh->begin_work;
+
+	my $getApi = sub {
+		unless ( defined $api ) {
+			$api = $bot->getApi( $family, $lang, 'beau' );
+
+			#$api->checkAccount;
+		}
+	};
+
+	my $processEdit = sub {
+		my $row = shift;
+		eval {
+			if ( $cnt % 100 == 0 )
+			{
+				$dbh->commit;
+				$dbh->begin_work;
+			}
+			$cnt++;
+
+			my %edit;
+
+			$edit{oldContent} = $cache->loadRevisionText( $row->{rc_oldrevid} );
+			$edit{newContent} = $cache->loadRevisionText( $row->{rc_newrevid} );
+			$edit{comment}    = $row->{rc_comment};
+			$edit{user}       = $row->{rc_user};
+			$edit{title}      = $row->{rc_page};
+
+			if ( defined $row->{rc_user} and $row->{rc_user} =~ /^\d+\.\d+\.\d+\.\d+$/ ) {
+
+				# FIXME: Check if this is valid IP address
+				my @whois = $ripeDb->lookup( $row->{rc_user} );
+				$edit{whois} = $whois[-1]
+				  if @whois;
+			}
+
+			my $score = $detector->getScore(%edit);
+
+			$updateScore->execute( $score, $row->{rc_id} );
+			unless ( $updateScore->rows ) {
+				$insertScore->execute( $row->{rc_id}, $score, undef, -1 );
+			}
+			$logger->info("Edit $project->{name}, $row->{rc_timestamp}, $row->{rc_user}, score: $score");
+		};
+		if ($@) {
+			$logger->error("Unable to process edit $project->{name}, $row->{rc_timestamp}, $row->{rc_user}: $@");
+		}
+	};
+
+	my @queue;
+	my %missingRevisions;
+
+	my $fetchRevisions = sub {
+		$getApi->();
+		my $response = $api->query(
+			'action' => 'query',
+			'revids' => [ keys %missingRevisions ],
+			'prop'   => 'revisions',
+			'rvprop' => 'content|ids',
+		);
+		$cache->{dbh}->begin_work;
+		foreach my $page ( values %{ $response->{query}->{pages} } ) {
+			foreach my $revision ( values %{ $page->{revisions} } ) {
+				next unless defined $revision->{'*'};
+				$cache->storeRevisionText( $revision->{revid}, $revision->{'*'} );
+			}
+		}
+		$cache->{dbh}->commit;
+		foreach my $row (@queue) {
+			$processEdit->($row);
+		}
+		@queue            = ();
+		%missingRevisions = ();
+	};
+
+	$selectEdits->execute( $project->{id} );
+	while ( my $row = $selectEdits->fetchrow_hashref ) {
+		my $missing = 0;
+
+		foreach ( %{$row} ) {
+			utf8::decode($_);
+		}
+
+		unless ( defined $row->{rc_oldrevid} ) {
+			$getApi->();
+
+			my $iterator = $api->getIterator(
+				'action' => 'query',
+				'revids' => $row->{rc_newrevid},
+			);
+			my $page = $iterator->next;
+			next unless $page;
+			next unless $page->{pageid};
+			$iterator = $api->getIterator(
+				'action'    => 'query',
+				'pageids'   => $page->{pageid},
+				'prop'      => 'revisions',
+				'rvprop'    => 'ids',
+				'rvlimit'   => 2,
+				'rvdir'     => 'older',
+				'rvstartid' => $row->{rc_newrevid},
+			);
+			$page = $iterator->next;
+			my @revisions = grep { $_ != $row->{rc_newrevid} } map { $_->{revid} } values %{ $page->{revisions} };
+
+			if ( @revisions == 1 ) {
+				my $oldrevid = shift @revisions;
+				$logger->info("Found oldrevid for $row->{rc_newrevid} of '$row->{rc_title}': $oldrevid");
+				die "Invalid revid!\n"
+				  unless $row->{rc_newrevid} > $oldrevid;
+				$updateOldrevid->execute( $oldrevid, $row->{rc_id} );
+				$row->{rc_oldrevid} = $oldrevid;
+			}
+			else {
+				$logger->info("Unable to find oldrevid for $row->{rc_newrevid} of '$row->{rc_title}'");
+			}
+		}
+
+		next unless defined $row->{rc_oldrevid};
+
+		foreach my $revid ( $row->{rc_oldrevid}, $row->{rc_newrevid} ) {
+			next if $cache->isRevisionTextCached($revid);
+			$missing++;
+			$missingRevisions{$revid}++;
+			$logger->debug("Revision $revid from $project->{name} is missing");
+		}
+
+		if ($missing) {
+			push @queue, $row;
+		}
+		else {
+			$processEdit->($row);
+		}
+		if ( scalar keys %missingRevisions >= 48 ) {
+			$fetchRevisions->();
+		}
+	}
+	$fetchRevisions->()
+	  if @queue;
+
+	$dbh->commit;
+}

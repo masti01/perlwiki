@@ -1,0 +1,354 @@
+package ClueBot;
+
+use strict;
+use warnings;
+use utf8;
+use lib "..";
+use Bot4;
+use Data::Dumper;
+use Text::Diff;
+use Log::Any;
+
+my $logger = Log::Any->get_logger();
+my $bot    = undef;
+
+sub setup {
+	my $client = shift;
+	$bot = shift;
+
+	$client->registerHandler( 'rc edit', \&rc_edit );
+}
+
+sub rc_edit {
+	my ( $this, $data ) = @_;
+
+	return unless $data->{channel} eq '#pl.wikipedia';
+
+	my $api = $bot->getApi( "wikipedia", "pl" );    # FIXME
+	$data->{namespace} = $api->getPageNamespace( $data->{title} );
+
+	if ( $data->{flags}->{new} and $data->{namespace} == 0 ) {
+		main::spawn_task( \&checkNewArticle, $data );
+	}
+	elsif ( !$data->{flags}->{new} ) {
+
+		# FIXME
+		# main::spawn_task( \&checkEdit, $data );
+	}
+}
+
+sub checkNewArticle($) {
+	my $data = shift;
+
+	my %checks = (
+		'cv'     => 1,
+		'speedy' => 1,
+	);
+
+	$bot->status("Checking: $data->{title}");
+	my $api = $bot->getApi( "wikipedia", "pl" );    # FIXME
+	$api->checkAccount;
+
+	$logger->info("[[$data->{title}]] has been created, size: $data->{size}b");
+
+	my $page;
+	eval {
+		my %query = (
+			'action'  => 'query',
+			'prop'    => 'info|revisions|links|categories|extlinks',
+			'intoken' => 'edit',
+			'rvprop'  => 'content|comment|timestamp|user',
+			'rvlimit' => 1,
+			'rvdir'   => 'older',
+			'cllimit' => 100,
+			'ellimit' => 100,
+			'titles'  => $data->{title},
+			'maxlag'  => 10,
+		);
+		my $response = $api->query(%query);
+		($page) = values %{ $response->{query}->{pages} };
+
+		# ponów próbę
+		if ( exists $page->{missing} ) {
+			sleep(5);
+			$response = $api->query(%query);
+			($page) = values %{ $response->{query}->{pages} };
+		}
+	};
+	if ($@) {
+		$logger->error($@);
+		return;
+	}
+
+	if ( exists $page->{missing} ) {
+		$logger->warn("[[$data->{title}]] is missing");
+		return;
+	}
+
+	my ($revision) = values %{ $page->{revisions} };
+	my $content = $revision->{'*'};
+
+	my %categories = map { $_->{title} => 1 } values %{ $page->{categories} };
+	$logger->debug( "[[$data->{title}]] kategorie: " . join( ", ", sort keys %categories ) ) if scalar keys %categories;
+
+	my $type;
+
+	if ( $content eq '' ) {
+		$type   = 'pusta?';
+		%checks = ();
+	}
+	elsif ( exists $page->{redirect} ) {
+		$type   = 'przekierowaniem (API)';
+		%checks = ();
+
+		# sprawdzać czy redir jest do przestrzeni głównej i do istniejącego artu
+	}
+	elsif ( $content =~ /^#REDIRECT\s*\[\[.+?\]\]/i ) {
+		$type   = 'przekierowaniem (content)';
+		%checks = ();
+	}
+	elsif ( exists $categories{'Kategoria:Artykuły w edycji'} ) {
+		$type = 'w edycji';
+		delete $checks{speedy};
+	}
+	elsif ( exists $categories{'Kategoria:Artykuły w przebudowie'} ) {
+		$type = 'w przebudowie';
+		delete $checks{speedy};
+	}
+	elsif ( exists $categories{'Kategoria:Strony ujednoznaczniające'} ) {
+		$type = 'stroną ujednoznaczniającą';
+		delete $checks{speedy};
+	}
+	elsif ( exists $categories{'Kategoria:Ekspresowe kasowanie'} ) {
+		$type = 'oznaczona do skasowania';
+		delete $checks{speedy};
+	}
+
+	$logger->info("[[$data->{title}]] strona jest $type") if defined $type;
+
+	if ( $checks{speedy} ) {
+		$logger->info("[[$data->{title}]] sprawdzanie czy strona nadaje się do {{ek}}");
+		my $score = score($content);
+		$logger->info("[[$data->{title}]] score: $score");
+
+		# Więcej na [[Specjalna:Wszystkie_komunikaty]]
+		# lub http://svn.wikimedia.org/viewvc/mediawiki/trunk/phase3/languages/messages/MessagesPl.php
+
+		my $tmpcontent = $content;
+
+		$tmpcontent =~ s/\s+/ /g;
+
+		my $count = 1;
+		while ($count) {
+			$count = 0;
+			$count += $tmpcontent =~ s/Tekst tłustą czcionką//g;
+			$count += $tmpcontent =~ s/Tekst pochyłą czcionką//g;
+			$count += $tmpcontent =~ s/Tytuł linku//g;
+			$count += $tmpcontent =~ s{http://www.example.com nazwa linku}{}g;
+			$count += $tmpcontent =~ s/Tekst nagłówka//g;
+			$count += $tmpcontent =~ s/Przyklad.jpg//g;
+			$count += $tmpcontent =~ s/Przyklad.ogg//g;
+			$count += $tmpcontent =~ s/Pl-przykład.ogg//g;
+			$count += $tmpcontent =~ s/Tutaj wprowadź wzór//g;
+			$count += $tmpcontent =~ s/Tutaj wstaw niesformatowany tekst//g;
+			$count += $tmpcontent =~ s/Tekst indeksem (?:górnym|dolnym)//g;
+			$count += $tmpcontent =~ s/Nazwa kategorii//g;
+
+			$count += $tmpcontent =~ s/\[\[\s*\]\]//g;
+			$count += $tmpcontent =~ s/'''\s*'''//g;
+			$count += $tmpcontent =~ s/(?:^|[^'])''\s*''(?:$|[^'])//g;
+			$count += $tmpcontent =~ s{<sup>\s*</sup>}{}g;
+			$count += $tmpcontent =~ s{<sub>\s*</sub>}{}g;
+			$count += $tmpcontent =~ s{<math>\s*</math>}{}g;
+			$count += $tmpcontent =~ s{<nowiki>\s*</nowiki>}{}g;
+			$count += $tmpcontent =~ s{\[\[Kategoria:\s*\]\]}{}g;
+			$count += $tmpcontent =~ s{<!--\s*-->}{}g;
+			$count += $tmpcontent =~ s{----}{}g;
+			$count += $tmpcontent =~ s{==\s*==}{}g;
+		}
+		$tmpcontent =~ s/(.)\1+/$1/g;
+
+		my $template;
+		my $summary;
+		if ( length($tmpcontent) < 35 ) {
+			$summary  = '{{[[Template:Ek|ek]]}} - prawdopodobnie eksperyment edycyjny';
+			$template = '{{ek|prawdopodobnie eksperyment edycyjny}}';
+		}
+		elsif ( length($tmpcontent) < 75 and $score < 0 ) {
+			$summary  = '{{[[Template:Ek|ek]]}} - prawdopodobnie eksperyment edycyjny';
+			$template = '{{ek|prawdopodobnie eksperyment edycyjny}}';
+		}
+		elsif ( $content !~ / / ) {
+			$summary  = '{{[[Template:Ek|ek]]}} - artykuł nie zawiera spacji, prawdopodobnie eksperyment edycyjny';
+			$template = '{{ek|artykuł nie zawiera spacji, prawdopodobnie eksperyment edycyjny}}';
+		}
+
+		if ( defined $template ) {
+			if ( $tmpcontent ne $content ) {
+				$logger->debug("[[$data->{title}]] treść (odfiltrowana):\n$tmpcontent");
+			}
+
+			$logger->debug("[[$data->{title}]] treść:\n$content");
+			$logger->debug("[[$data->{title}]] template: $template");
+			$logger->debug("[[$data->{title}]] summary : $summary");
+
+			if ( exists $revision->{anon} ) {
+				eval {
+					$api->edit( #
+						'title'          => $page->{title},
+						'token'          => $page->{edittoken},
+						'starttimestamp' => $page->{starttimestamp},
+						'minor'       => 1,
+						'nocreate'    => 1,
+						'summary'     => $summary,
+						'prependtext' => $template . "\n",
+					);
+				};
+				$logger->error("[[$data->{title}]] $@") if $@;
+			}
+			else {
+				$logger->info("[[$data->{title}]] zignorowanie edycji, użytkownik zarejestrowany: $revision->{user}");
+			}
+		}
+	}
+}
+
+sub getUserData($) {
+	my $name = shift;
+
+	# Jakieś cache potrzebne
+
+	my $api = $bot->getApi( "wikipedia", "pl" );    # FIXME
+	my $response = $api->query(
+		'list'    => 'allusers',
+		'aulimit' => 1,
+		'aufrom'  => $name,
+		'auprop'  => 'groups|editcount',
+	);
+
+	my ($entry) = values %{ $response->{query}->{allusers} };
+	return undef if $entry->{name} ne $name;
+
+	$entry->{groups} = [ map { $_ => 1 } values %{ $entry->{groups} } ] if $entry->{groups};
+
+	return $entry;
+}
+
+sub isPageIgnored($) {
+
+}
+
+sub isPageChecked($) {
+
+}
+
+sub isUserIgnored($) {
+
+}
+
+sub checkEdit {
+	my $data = shift;
+
+	if ( $logger->is_debug ) {
+		$logger->debug( Dumper($data) );
+	}
+
+	# Ignoruj nowe strony, ich się nie da rewertować
+	return
+	  if $data->{flags}->{new};
+
+	# Ignoruj bocie edycje
+	return
+	  if $data->{flags}->{bot};
+
+	# Ignoruj strony z listy opt-out
+	return
+	  if isPageIgnored( $data->{title} );
+
+	# Sprawdzaj strony z przestrzeni głównej oraz te z opt-in
+	return
+	  unless $data->{namespace} == 0
+		  or isPageChecked( $data->{title} );
+
+	# Ignoruj edytowanie swojej własnej strony
+
+	# Ignoruj użytkowników zarejestrowanych
+	return
+	  unless MediaWiki::Utils::isAnonymous( $data->{user} );
+
+	# Ignoruj sysopów, botów, redaktorów
+	# xxx - patrz wyżej
+
+	# CB ignoruje ipki z liczbą edycji > 50,
+	# ale to nie ma sensu dla dynamicznych adresów
+
+	unless ( $data->{diff} =~ /oldid=(\d+)/ ) {
+		die "Unable to find oldid parameter in url: $data->{diff}\n";
+	}
+	my $oldid = $1;
+	unless ( $data->{diff} =~ /diff=(\d+)/ ) {
+		die "Unable to find diff parameter in url: $data->{diff}\n";
+	}
+	my $newid = $1;
+
+	my $api = $bot->getApi( "wikipedia", "pl" );    # FIXME
+	my $response = $api->query(
+		'titles'  => $data->{title},
+		'prop'    => 'revisions|info',
+		'intoken' => 'edit',
+		'rvprop'  => 'content|timestamp|user|comment|ids',
+
+		#'rvtoken' => 'rollback',
+		#'rvlimit' => '2',
+		'rvdir'     => 'newer',
+		'rvstartid' => $oldid,
+		'maxlag'    => 2,
+	);
+
+	my ($page) = values %{ $response->{query}->{pages} };
+
+	if ( exists $page->{missing} ) {
+		$logger->info("[[$page->{title}]] is missing");
+		return;
+	}
+	my @revisions = values %{ $page->{revisions} };
+
+	my $old = shift @revisions;
+	die '$oldid != $old->{revid}' unless $oldid == $old->{revid};
+
+	my $new = shift @revisions;
+	die '$newid != $new->{revid}' unless $newid == $new->{revid};
+	die '$data->{user} ne $new->{user}' unless $data->{user} eq $new->{user};
+
+	die 'There are more revisions!' if @revisions;
+
+	$logger->info("[[$page->{title}]] has been edited by $new->{user}");
+	print diff( \$old->{'*'}, \$new->{'*'} ) . "\n";
+
+	my @diff = @{ Algorithm::Diff::diff( [ split "\n", $old->{'*'} ], [ split "\n", $new->{'*'} ] ) };
+	my @addedLines;
+	my @removedLines;
+	foreach my $hunk (@diff) {
+		foreach my $change ( @{$hunk} ) {
+			my ( $what, undef, $line ) = @{$change};
+			if ( $what eq '+' ) {
+				push @addedLines, $line;
+			}
+			else {
+				push @removedLines, $line;
+			}
+		}
+	}
+
+	# Wykonaj heurystyki
+
+=head
+- modyfikacje własnych stron wikipedystów są ignorowane
+- pobranie ostatniej wersji strony, jeśli revid się nie zgadza z tym z komunikatu, to znaczy, że strona była zmieniona i edycja jest ignorowana,
+=cut
+
+}
+
+1;
+
+# perltidy -et=8 -l=0 -i=8

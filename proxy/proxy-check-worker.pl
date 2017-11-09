@@ -1,0 +1,298 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Data::Dumper;
+use FindBin qw($RealBin);
+use ProxyDatabase;
+use AddressChecker;
+use LWP::UserAgent;
+use WWW::Mechanize;
+use IO::Handle;
+use Storable qw(freeze thaw);
+use File::Spec;
+use Log::Any;
+use Log::Any::Adapter;
+use LWP::Protocol::socks;
+
+binmode STDIN;
+binmode STDOUT;
+STDOUT->autoflush(1);
+
+my $db      = "$RealBin/../var/proxy.sqlite";
+my $testUrl = 'http://94.23.242.48/~beau/cgi-bin/verify.pl?id=$sessionId';
+my $agent   = 'Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.0.7) Gecko/2009021910 Firefox/3.0.7';
+
+my %ignoredAddresses = map { $_ => 1 } qw(94.23.242.48 178.33.53.23 178.32.200.207 127.0.0.1);
+
+# Send all logs to Log::Log4perl
+use Log::Log4perl;
+Log::Log4perl->init( File::Spec->join( $RealBin, 'log4perl.conf' ) );
+Log::Any::Adapter->set('Log4perl');
+
+my $logger = Log::Any::get_logger;
+$logger->info("Worker is being started");
+
+my $dbh = ProxyDatabase->new( 'file' => $db );
+
+sub checkProxyLwp {
+	my $info  = shift;
+	my $proxy = shift;
+
+	$logger->info("Checking proxy '$proxy' using LWP::UserAgent");
+	my $result = {
+		'address' => undef,
+		'status'  => 0,
+	};
+	my $sessionId = $dbh->createSession();
+	eval {
+		my $ua = LWP::UserAgent->new(
+			'agent'   => $agent,
+			'timeout' => 30,
+		);
+		$ua->proxy( [ 'http', 'https' ] => $proxy );
+
+		my $url = $testUrl;
+		$url =~ s/\$sessionId/$sessionId/g;
+
+		$ua->get($url);
+		my $address = $dbh->getSessionAddress($sessionId);
+
+		$result->{address} = $address;
+		$result->{status} = defined $address ? 1 : 0;
+	};
+	my $error = $@;
+	$dbh->destroySession($sessionId);
+	die $error
+	  if $error;
+
+	return $result;
+}
+
+sub checkHttpProxy {
+	my $info = shift;
+
+	# Do not check proxies without a specified port
+	return { status => 0 }
+	  unless defined $info->{port};
+
+	my $result = checkProxyLwp( $info, "http://$info->{address}:$info->{port}/" );
+	$result->{type}     = 'http';
+	$result->{accepted} = '1';
+	return $result;
+}
+
+sub checkSocks4Proxy {
+	my $info = shift;
+
+	# Do not check proxies without a specified port
+	return { status => 0 }
+	  unless defined $info->{port};
+
+	my $result = checkProxyLwp( $info, "socks4://$info->{address}:$info->{port}/" );
+	$result->{type}     = 'socks4';
+	$result->{accepted} = '1';
+	return $result;
+}
+
+sub checkSocks5Proxy {
+	my $info = shift;
+
+	# Do not check proxies without a specified port
+	return { status => 0 }
+	  unless defined $info->{port};
+
+	my $result = checkProxyLwp( $info, "socks://$info->{address}:$info->{port}/" );
+	$result->{type}     = 'socks5';
+	$result->{accepted} = '1';
+	return $result;
+}
+
+sub checkWebProxy {
+	my $info = shift;
+
+	# Do not check proxies with a specified port
+	return { status => 0 }
+	  if defined $info->{port};
+
+	# Do not check non-web proxies
+	return { status => 0 }
+	  unless $info->{address} =~ m{^https?://}i;
+
+	$logger->info("Checking proxy '$info->{address}' using WWW::Mechanize");
+	my $result = {
+		'address' => undef,
+		'status'  => 0,
+	};
+	my $sessionId = $dbh->createSession();
+	eval {
+		my $mech = new WWW::Mechanize(
+			'agent'     => $agent,
+			'timeout'   => 30,
+			'autocheck' => 0,
+			'quiet'     => 1,
+		);
+
+		my $response = $mech->get( $info->{address} );
+		return unless $response->is_success;
+
+		my $form;
+		my $field;
+
+		foreach my $f ( 'u', 'q', 'url', 'rxproxyuri' ) {
+			$form  = $mech->form_with_fields($f);
+			$field = $f;
+			next if $form and $form->method eq 'SEND';
+			last if $form;
+		}
+
+		unless ( defined $form ) {
+			$logger->debug("Unable to find form");
+			return;
+		}
+		my $url = $testUrl;
+		$url =~ s/\$sessionId/$sessionId/g;
+		$mech->field( $field, $url );
+		$mech->submit;
+
+		my $address = $dbh->getSessionAddress($sessionId);
+
+		$result->{address} = $address;
+		$result->{status}  = defined $address ? 1 : 0;
+		$result->{type}    = 'web proxy';
+	};
+	my $error = $@;
+	$dbh->destroySession($sessionId);
+	die $error
+	  if $error;
+
+	$result->{accepted} = '1';
+	return $result;
+}
+
+my @methods = (    #
+	\&checkHttpProxy,
+	\&checkSocks4Proxy,
+	\&checkSocks5Proxy,
+	\&checkWebProxy,
+);
+
+sub checkProxy {
+	my $info = shift;
+
+	foreach my $method (@methods) {
+
+		# TODO: Check till no new addresses are discovered...
+		my $result;
+		for ( my $i = 0 ; $i < 3 ; $i++ ) {
+			$result = $method->($info);
+			last if $result->{status};
+			sleep(1)
+			  if $result->{accepted};
+		}
+		return $result
+		  if $result->{status};
+	}
+	return { status => 0 };
+}
+
+# ------------------------------------------------------------------------------
+
+sub sendMessage {
+	my $message = shift;
+
+	if ( $logger->is_debug ) {
+		$logger->debug( "Sending a message:\n" . Dumper($message) );
+	}
+
+	my $data = freeze($message);
+	STDOUT->print( bytes::length($data) . "\n" . $data )
+	  or die "Unable to send a message: $!\n";
+}
+
+sub readMessage {
+	my $size = readline(STDIN);
+
+	die "Unable to read a message header: $!\n"
+	  unless defined $size;
+
+	chomp($size);
+
+	my $buffer;
+	my $len = read( STDIN, $buffer, $size );
+
+	if ( $len < $size ) {
+		die "Received a corrupted message: expected $len bytes instead of $size bytes\n";
+	}
+	my $message = thaw $buffer;
+	if ( $logger->is_debug ) {
+		$logger->debug( "Received a message:\n" . Dumper($message) );
+	}
+	return $message;
+}
+
+# ------------------------------------------------------------------------------
+
+eval {
+	$logger->info("Worker is entering main loop");
+	while (1) {
+		$0 = 'proxy-check-worker: idle';
+		last
+		  if eof(STDIN);
+		my $message = readMessage();
+
+		die "Invalid message\n"
+		  unless ref($message) eq 'HASH' and defined $message->{command};
+
+		if ( $message->{command} eq 'CHECK' ) {
+			$0 = "proxy-check-worker: checking $message->{address}";
+
+			if ( $message->{address} =~ /^(.+?):(\d+)$/ ) {
+				$message->{address} = $1;
+				$message->{port}    = $2;
+			}
+
+			my $result = checkProxy($message);
+
+			if ( $result->{status} ) {
+
+				my $reject = undef;
+
+				if ( $result->{address} !~ /^\d+\.\d+\.\d+\.\d+$/ ) {
+					$reject = "not a valid IPv4 address '$result->{address}'";
+				}
+				elsif ( $ignoredAddresses{ $result->{address} } ) {
+					$reject = "ignored address '$result->{address}'";
+				}
+
+				if ( defined $reject ) {
+					$logger->info("Ignoring proxy $message->{proxy}: $reject");
+					$result = { status => 0 };
+				}
+				else {
+
+					# Check type of address (isp, country, service)
+					my $addressCheck = AddressChecker::check( $result->{address} );
+					$result->{block}       = $addressCheck->{block};
+					$result->{hostname}    = $addressCheck->{hostname};
+					$result->{addressType} = $addressCheck->{type};
+				}
+			}
+
+			$result->{proxy}   = $message->{proxy};
+			$result->{command} = 'CHECKRESULT';
+			sendMessage($result);
+		}
+		elsif ( $message->{command} eq 'QUIT' ) {
+			last;
+		}
+		else {
+			die "Unsupported command '$message->{command}'\n";
+		}
+	}
+	$logger->info("Worker is being terminated");
+};
+if ($@) {
+	$@ =~ s/\s+$//;
+	$logger->fatal("Worker is being terminated: $@");
+	exit(1);
+}

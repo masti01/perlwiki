@@ -1,0 +1,300 @@
+package Notify;
+
+use strict;
+use warnings;
+use utf8;
+use IO::Socket::UNIX;
+use Data::Dumper;
+use Log::Any;
+
+my $logger = Log::Any->get_logger();
+
+my $irssiSocketPath = $ENV{HOME} . "/irssi.sock";
+
+my %settings = (    #
+	'#pl.wikipedia' => {    #
+		'blocks'       => 1,
+		'rights'       => 1,
+		'freenode'     => '#wikipedia-pl',
+		'stalkedPages' => [                  #
+			'Strona główna',
+		],
+	},
+	'#pl.wikisource' => {                        #
+		'blocks'       => 1,
+		'rights'       => 1,
+		'stalkedPages' => [                  #
+			'Wikiźródła:Skryptorium/Pulpit propozycji',
+			'Wikiźródła:Skryptorium/Pulpit ogólny',
+			'Wikiźródła:Skryptorium/Pulpit techniczny',
+			'Wikiźródła:Skryptorium/Prawo autorskie',
+			'Wikiźródła:Prośby do administratorów',
+			'Wikiźródła:Tablica ogłoszeń',
+		],
+		'recursiveStalkedPages' => [         #
+			'Wikiźródła:Strona główna',
+		],
+		'freenode' => '#wikisource-pl',
+	},
+	'#pl.wiktionary' => {                        #
+		'blocks'   => 1,
+		'rights'   => 1,
+		'freenode' => '#wiktionary-pl',
+	},
+	'#test.wikipedia' => {                       #
+		'blocks'   => 0,
+		'rights'   => 0,
+		'freenode' => '#cvn-wp-pl',
+	},
+);
+
+sub setup {
+	my $client = shift;
+	my $bot    = shift;
+
+	$client->registerHandler( 'rc rights',      \&rc_rights );
+	$client->registerHandler( 'rc autopromote', \&rc_rights );
+	$client->registerHandler( 'rc block',       \&rc_block );
+	$client->registerHandler( 'rc reblock',     \&rc_block );
+	$client->registerHandler( 'rc unblock',     \&rc_block );
+	$client->registerHandler( 'rc edit',        \&rc_edit );
+}
+
+sub sendMessage($$) {
+	my ( $recipient, $content ) = @_;
+
+	if ( $logger->is_debug ) {
+		$logger->debug("Sending message to $recipient: $content");
+	}
+	eval {
+		my $client = IO::Socket::UNIX->new(
+			Peer => $irssiSocketPath,
+			Type => SOCK_DGRAM,
+		) or die $!;
+
+		my $cmd = "MSG $recipient $content";
+		utf8::encode($cmd) if utf8::is_utf8 $cmd;
+
+		$client->send($cmd) or die $!;
+	};
+	if ($@) {
+		$logger->warn("Unable to contact irssi: $@");
+	}
+}
+
+sub scrambleUser {
+	my $name = shift;
+	$name =~ s/^(.)(.)/$1\x02\x02$2/;
+	return $name;
+}
+
+sub rc_rights {
+	my ( $this, $data ) = @_;
+	if ( $logger->is_trace ) {
+		$logger->trace( "Rights\n" . Dumper($data) );
+	}
+
+	my @data;
+	my $autopromote = $data->{action} eq 'autopromote';
+
+	if ( $data->{channel} =~ /^#pl\./ or $data->{channel} eq '#meta.wikimedia' or $data->{channel} eq '#test.wikipedia') {
+
+		if ( @data = ( $data->{summary} =~ m{^(?:zmienił\(a\) uprawnienia użytkownika|zmienił?a? przynależność) [^:]+:(.+?) (?:do grup )?\((.+?) \x{2192} (.+?)\)(?:: (.+?))?$}i ) ) {
+
+		}
+		elsif ( @data = ( $data->{summary} =~ /changed group membership for [^:]+:(.+?) from (.+?) to (.+?)(?:: (.+?))?$/i ) ) {
+			
+		}
+		elsif ( $autopromote and @data = ( $data->{summary} =~ m{\((.+?) \x{2192} (.+?)\)(?:: (.+?))?$}i ) ) {
+			unshift @data, $data->{user};
+		}
+		elsif ( $autopromote and @data = ( $data->{summary} =~ m{was automatically promoted from (.+?) to (.+?)(?:: (.+?))?$}i ) ) {
+			unshift @data, $data->{user};
+		}
+		else {
+			$logger->error("Unable to parse: $data->{summary}");
+			return;
+		}
+	}
+	else {
+		$logger->warn("Unknown target $data->{channel}");
+		return;
+	}
+
+	my ( $target, $old, $new, $reason ) = @data;
+
+	if ( $target =~ s/\@(.+?)(wiki|wiktionary|wikisource|wikibooks|wikinews|wikiquote|wikiversity)$// ) {
+		$data->{channel} = "#$1.$2";
+		$data->{channel} .= 'pedia'
+		  if $2 eq 'wiki';
+	}
+
+	my $settings = $settings{ $data->{channel} };
+	return unless $settings;
+	return unless $settings->{rights};
+
+	my %privs = map { $_ => '-' } split ', ', $old;
+	foreach my $group ( split ', ', $new ) {
+		if ( exists $privs{$group} ) {
+			delete $privs{$group};
+		}
+		else {
+			$privs{$group} = '+';
+		}
+	}
+	delete $privs{'brak'};
+	delete $privs{'(none)'};
+	my @diff;
+	foreach my $group ( sort keys %privs ) {
+		push @diff, $privs{$group} . $group;
+	}
+	my $comment;
+	my $userName = scrambleUser( $data->{user} );
+
+	if ( $data->{user} eq $target ) {
+		$comment = "\x02$userName\x02" . ( $autopromote ? ' automatycznie' : '' ) . " zmienia swoje uprawnienia: ";
+	}
+	else {
+		$comment = "\x02$userName\x02 zmienia uprawnienia użytkownika \x02$target\x02: ";
+	}
+	$comment .= join( ' ', @diff ) . ( defined $reason ? ", powód: $reason" : '' );
+	$comment .= ' #' if $comment =~ /(?:\[\[|\{\{)/;
+
+	sendMessage( $settings->{freenode}, $comment );
+}
+
+sub rc_block {
+	my ( $this, $data ) = @_;
+	if ( $logger->is_trace ) {
+		$logger->trace( "Block\n" . Dumper($data) );
+	}
+	my $settings = $settings{ $data->{channel} };
+	return unless $settings;
+	return unless $settings->{blocks};
+
+	my $target;
+	my $reason;
+	if ( ( $target, $reason ) = $data->{summary} =~ /\[\[\x0302[^:]+:(.+?)\x0310\]\](?:,? (.+?))?$/ ) {
+
+		# ...
+	}
+	elsif ( ( $target, $reason ) = $data->{summary} =~ /^\S+ [^:]+:(.+?)(?:: (.+?))?$/ ) {
+
+		# ...
+	}
+	else {
+		$logger->warn("Unable to parse: $data->{summary}");
+		return;
+	}
+
+	my $type;
+
+	if ( $target =~ m{^\d+\.\d+\.\d+\.\d+$} ) {
+		$type = 'ip';
+	}
+	elsif ( $target =~ m{^\d+\.\d+\.\d+\.\d+/\d+$} ) {
+		$type = 'range';
+	}
+	else {
+		$type = 'user';
+	}
+
+	return unless $type eq 'range';
+
+	my %actions = (
+		'block'   => 'zakłada blokadę na',
+		'reblock' => 'modyfikuje blokadę',
+		'unblock' => 'zdejmuje blokadę',
+	);
+	my %description;
+
+	if ( $data->{action} eq 'block' ) {
+		%description = (
+			'ip'    => 'adres IP',
+			'range' => 'zakres',
+			'user'  => 'użytkownika',
+		);
+	}
+	else {
+		%description = (
+			'ip'    => 'adresu IP',
+			'range' => 'zakresu',
+			'user'  => 'użytkownika',
+		);
+	}
+
+	my $userName = scrambleUser( $data->{user} );
+	my $comment  = "\x02$userName\x02 $actions{$data->{action}} $description{$type} \x02$target\x02";
+
+	if ( defined $reason ) {
+		$reason =~ s/\[\[[^\[|]+\|(.+?)\]\]/$1/g;
+		$comment .= ", $reason";
+	}
+
+	$comment .= ' #' if $comment =~ /(?:\[\[|\{\{)/;
+
+	sendMessage( $settings->{freenode}, $comment );
+}
+
+sub rc_edit {
+	my ( $this, $data ) = @_;
+	if ( $logger->is_trace ) {
+		$logger->trace( "Edit\n" . Dumper($data) );
+	}
+	return if $data->{flags}->{bot};
+	my $settings = $settings{ $data->{channel} };
+	return unless $settings;
+	return unless $settings->{stalkedPages};
+
+	my $stalked = 0;
+
+	foreach my $entry ( @{ $settings->{stalkedPages} } ) {
+		if ( ref($entry) eq 'Regexp' ) {
+			if ( $data->{title} =~ /$entry/ ) {
+				$stalked = 1;
+				last;
+			}
+		}
+		else {
+			if ( $data->{title} eq $entry ) {
+				$stalked = 1;
+				last;
+			}
+		}
+	}
+
+	my $embeddedIn;
+
+=head
+	if ( $settings->{recursiveStalkedPages} ) {
+		if ( !$cache{recursiveStalkedPages}->{nextCheck} or $cache{recursiveStalkedPages}->{nextCheck} < time() ) {
+			eval {
+
+				# FIXME
+			};
+			if ($@) {
+				$logger->error($@);
+			}
+		}
+		$embeddedIn = $cache{recursiveStalkedPages}->{pages}->{ $data->{title} };
+		$stalked++ if defined $embeddedIn;
+	}
+=cut
+
+	return unless $stalked;
+
+	my $userName = scrambleUser( $data->{user} );
+	my $comment  = "\x02$userName\x02 modyfikuje stronę \x02$data->{title}\x02";
+	$comment .= " używaną jako szablon na \x02$embeddedIn\x02"
+	  if defined $embeddedIn;
+	$comment .= " $data->{diff}";
+	if ( defined $data->{summary} and $data->{summary} ne '' ) {
+		$comment .= ' z opisem: ' . $data->{summary};
+	}
+
+	sendMessage( $settings->{freenode}, $comment );
+}
+
+1;
+
+# perltidy -et=8 -l=0 -i=8

@@ -1,0 +1,4 @@
+#!/bin/sh
+
+kill -9 `cat $HOME/tools/var/run/rcbot.pid`
+DAEMON=1 perl $HOME/tools/rcbot.pl

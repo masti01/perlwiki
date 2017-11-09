@@ -1,0 +1,9 @@
+Changes
+Makefile.PL
+MANIFEST
+MyCollator.xs
+README
+t/ICU-MyCollator.t
+lib/ICU/MyCollator.pm
+typemap
+perlobject.map
